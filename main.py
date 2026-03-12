@@ -13,7 +13,7 @@ import concurrent.futures
 import threading
 import sys
 
-# --- CONSTANTS ---
+
 DARK_BG = "#0d1117"
 SIDEBAR_BG = "#161b22"
 ACCENT = "#58a6ff"
@@ -64,14 +64,14 @@ def headless_worker(grid_dim, selected_bots):
     """
     import sys, os, random
     
-    # Force the new background process to look in the current folder for bots
+
     if os.path.abspath('.') not in sys.path:
         sys.path.insert(0, os.path.abspath('.'))
 
     board = {}
     players = []
     
-    # Give the random number generator a nudge so cores don't generate identical matches
+
     random.seed() 
     
     start_positions = [(random.randint(5, grid_dim-6), random.randint(5, grid_dim-6)) for _ in selected_bots]
@@ -89,6 +89,7 @@ def headless_worker(grid_dim, selected_bots):
             'id': i + 1,
             'name': display_name,
             'module': mod,
+            'move_func': mod.move, # SECURITY PATCH 1: Locked Reference
             'pos': pos,
             'trail': [pos],
             'alive': True,
@@ -100,7 +101,7 @@ def headless_worker(grid_dim, selected_bots):
     max_ticks = grid_dim * grid_dim
     tick = 0
     
-    # Run the match at hyper-speed
+
     while tick < max_ticks:
         tick += 1
         alive = [p for p in players if p['alive']]
@@ -111,10 +112,25 @@ def headless_worker(grid_dim, selected_bots):
                 alive[0]['rank'] = 1
             break
 
+
+        safe_players = []
+        for other_p in players:
+            safe_players.append({
+                "id": other_p['id'],
+                "name": other_p['name'],
+                "pos": other_p['pos'], 
+                "alive": other_p['alive'],
+                "trail": list(other_p['trail'])
+            })
+
         for p in alive:
             p['survival'] += 1
             try:
-                move = p['module'].move(p['pos'], board.copy(), grid_dim, players)
+                move = p['move_func'](p['pos'], board.copy(), grid_dim, safe_players)
+                
+
+                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]:
+                    raise ValueError("Illegal Move Command")
                 
                 x, y = p['pos']
                 if move == "UP": y -= 1
@@ -134,12 +150,12 @@ def headless_worker(grid_dim, selected_bots):
                 p['alive'] = False
                 p['rank'] = current_rank_score
 
-    # Package up the results
-    results = {}
+
+    _engine_secure_results_v9 = {}
     for p in players:
-        results[p['name']] = {'rank': p['rank'], 'survival': p['survival']}
+        _engine_secure_results_v9[p['name']] = {'rank': p['rank'], 'survival': p['survival']}
         
-    return results
+    return _engine_secure_results_v9
 
 class TronApp:
     def __init__(self):
@@ -153,14 +169,14 @@ class TronApp:
             
         self.root.configure(bg=DARK_BG)
         
-        # Engine variables
+
         self.grid_dim = 60
         self.cell_size = 10
         self.available_bots = {}
         self.bot_colors = {}
         self.dim_colors = {} 
         
-        # Runtime variables
+
         self.players = []
         self.board = {}
         self.running = False
@@ -170,14 +186,14 @@ class TronApp:
         self.refresh_bot_list()
 
     def setup_layout(self):
-        # --- SIDEBAR ---
+
         self.sidebar = tk.Frame(self.root, width=250, bg=SIDEBAR_BG)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
         self.sidebar.pack_propagate(False)
 
         tk.Label(self.sidebar, text="TRON ENGINE", bg=SIDEBAR_BG, fg=ACCENT, font=("Courier", 18, "bold")).pack(pady=15)
 
-        # Bot Selection Area
+
         tk.Label(self.sidebar, text="Available Bots", bg=SIDEBAR_BG, fg="gray").pack(anchor=tk.W, padx=10)
         
         self.bot_scroll_frame = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
@@ -185,7 +201,7 @@ class TronApp:
         
         tk.Button(self.sidebar, text="REFRESH BOTS", command=self.refresh_bot_list, bg="#21262d", fg=TEXT_COLOR).pack(fill=tk.X, padx=10, pady=5)
 
-        # Visual Match Frame
+
         vis_frame = tk.LabelFrame(self.sidebar, text="Visual Match", bg=SIDEBAR_BG, fg="gray")
         vis_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -215,7 +231,7 @@ class TronApp:
         self.speed_var = tk.DoubleVar(value=1.0)
         tk.Scale(vis_frame, from_=0.25, to=25.0, resolution=0.25, variable=self.speed_var, orient=tk.HORIZONTAL, bg=SIDEBAR_BG, fg=TEXT_COLOR, label="Speed").pack(fill=tk.X, padx=10)
 
-        # Tournament Frame
+
         tour_frame = tk.LabelFrame(self.sidebar, text="Tournament (Headless)", bg=SIDEBAR_BG, fg="gray")
         tour_frame.pack(fill=tk.X, padx=10, pady=10)
         
@@ -228,7 +244,7 @@ class TronApp:
         self.btn_tourney = tk.Button(tour_frame, text="RUN TOURNAMENT", command=self.start_tournament, bg="#a371f7", fg="white")
         self.btn_tourney.pack(fill=tk.X, padx=10, pady=5)
 
-        # --- MAIN CANVAS ---
+
         self.canvas_frame = tk.Frame(self.root, bg=DARK_BG)
         self.canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
@@ -299,6 +315,7 @@ class TronApp:
                 'id': i + 1,
                 'name': display_name,
                 'module': mod,
+                'move_func': mod.move, # SECURITY PATCH 1: Locked Reference
                 'pos': pos,
                 'trail': [pos],
                 'alive': True,
@@ -327,7 +344,7 @@ class TronApp:
         
         self.canvas.delete("all")
 
-        # Cache dim colors and draw heatmap background rectangles
+
         if self.show_heatmap_var.get():
             self.dim_colors = {p['id']: get_dim_color(p['color']) for p in self.players}
             for x in range(self.grid_dim):
@@ -336,7 +353,7 @@ class TronApp:
                                                  (x+1)*self.cell_size, (y+1)*self.cell_size, 
                                                  fill=DARK_BG, outline="", tags=f"bg_cell_{x}_{y}")
 
-        # Draw Grid lines
+
         for i in range(0, self.grid_dim * self.cell_size, self.cell_size):
             self.canvas.create_line(i, 0, i, self.grid_dim*self.cell_size, fill="#111", tags="grid")
             self.canvas.create_line(0, i, self.grid_dim*self.cell_size, i, fill="#111", tags="grid")
@@ -415,10 +432,25 @@ class TronApp:
                                        text=f"WINNER: {winner}", fill="white", font=("Courier", 40, "bold"))
             return
 
+
+        safe_players = []
+        for other_p in self.players:
+            safe_players.append({
+                "id": other_p['id'],
+                "name": other_p['name'],
+                "pos": other_p['pos'], 
+                "alive": other_p['alive'],
+                "trail": list(other_p['trail'])
+            })
+
         for p in alive:
             p['survival'] += 1
             try:
-                move = p['module'].move(p['pos'], self.board.copy(), self.grid_dim, self.players)
+                move = p['move_func'](p['pos'], self.board.copy(), self.grid_dim, safe_players)
+                
+
+                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]:
+                    raise ValueError("Illegal Move Command")
                 
                 old_x, old_y = p['pos']
                 nx, ny = old_x, old_y
@@ -467,7 +499,7 @@ class TronApp:
                     self.canvas.itemconfig(f"p{p['id']}", fill=get_dead_color(p['color']))
                     self.canvas.delete(f"name_{p['id']}")
 
-        # Heatmap Update - Only run every 3 ticks to save frame rate
+
         if visual and self.show_heatmap_var.get() and self.players[0]['survival'] % 3 == 0:
             self.update_heatmap()
 
@@ -485,31 +517,33 @@ class TronApp:
         self.adjust_grid_size(len(selected))
         self.canvas.config(width=self.grid_dim*self.cell_size, height=self.grid_dim*self.cell_size)
 
-        # LOCK THE BUTTONS
+
         self.btn_tourney.config(state=tk.DISABLED)
         self.btn_pause.config(state=tk.DISABLED)
         self.canvas.delete("all")
         
         self.init_game_state(selected)
-        stats = {}
+        
+
+        _engine_secure_stats_v9 = {}
         for p in self.players:
-            stats[p['name']] = {'ranks': [0], 'survivals': [0], 'color': p['color']} 
+            _engine_secure_stats_v9[p['name']] = {'ranks': [0], 'survivals': [0], 'color': p['color']} 
             
         self.running = True
         
-        # DRAW THE INITIAL "0 COMPLETED" FRAME IMMEDIATELY
-        self.draw_tournament_progress(stats, 0, rounds)
+
+        self.draw_tournament_progress(_engine_secure_stats_v9, 0, rounds)
         self.root.update()
 
-        # Define the background manager
+
         def pool_manager():
             completed = 0
             
-            # Clear the seed data before actual results come in
+
             for p in self.players:
-                stats[p['name']] = {'ranks': [], 'survivals': [], 'color': p['color']}
+                _engine_secure_stats_v9[p['name']] = {'ranks': [], 'survivals': [], 'color': p['color']}
                 
-            # Spin up all available CPU cores
+
             with concurrent.futures.ProcessPoolExecutor() as executor:
                 futures = [executor.submit(headless_worker, self.grid_dim, selected) for _ in range(rounds)]
                 
@@ -522,30 +556,30 @@ class TronApp:
                         completed += 1
                         
                         for name, data in result.items():
-                            stats[name]['ranks'].append(data['rank'])
-                            stats[name]['survivals'].append(data['survival'])
+                            _engine_secure_stats_v9[name]['ranks'].append(data['rank'])
+                            _engine_secure_stats_v9[name]['survivals'].append(data['survival'])
                             
-                        self.root.after(0, self.draw_tournament_progress, stats, completed, rounds)
+                        self.root.after(0, self.draw_tournament_progress, _engine_secure_stats_v9, completed, rounds)
                     except Exception as e:
                         print(f"Match error on a worker thread: {e}")
                         
-            self.root.after(0, self.finalize_tournament, stats, rounds)
+            self.root.after(0, self.finalize_tournament, _engine_secure_stats_v9, rounds)
 
-        # Start the background manager
+
         threading.Thread(target=pool_manager, daemon=True).start()
 
-    def draw_tournament_progress(self, stats, current_round, total_rounds):
+    def draw_tournament_progress(self, _engine_secure_stats_v9, current_round, total_rounds):
         """Draws a live bar chart of the tournament standings on the canvas."""
         self.canvas.delete("all")
         w = self.canvas.winfo_width()
         
-        # Header
+
         self.canvas.create_text(w//2, 40, text=f"TOURNAMENT PROGRESS: ROUND {current_round} OF {total_rounds}", 
                                 fill="white", font=("Courier", 20, "bold"))
         
-        # Calculate current standings with Division-by-Zero protections
+
         standings = []
-        for name, data in stats.items():
+        for name, data in _engine_secure_stats_v9.items():
             avg_rank = sum(data['ranks']) / max(1, len(data['ranks']))
             avg_surv = sum(data['survivals']) / max(1, len(data['survivals']))
             standings.append({
@@ -555,16 +589,16 @@ class TronApp:
                 'color': data['color']
             })
             
-        # Sort by best rank (lowest number), then by longest survival time
+
         standings.sort(key=lambda x: (x['avg_rank'], -x['avg_surv']))
         
         y_offset = 100
         bar_max_width = max(100, w - 500)
         
-        # Ensure max_surv is never 0 to prevent crashes
+
         max_surv = max([s['avg_surv'] for s in standings] + [1])
         
-        # Column Headers
+
         self.canvas.create_text(40, y_offset, text="Pos", fill="gray", font=("Courier", 12, "bold"), anchor=tk.W)
         self.canvas.create_text(100, y_offset, text="Bot Name", fill="gray", font=("Courier", 12, "bold"), anchor=tk.W)
         self.canvas.create_text(300, y_offset, text="Avg Rank", fill="gray", font=("Courier", 12, "bold"), anchor=tk.W)
@@ -577,28 +611,28 @@ class TronApp:
             self.canvas.create_text(130, y_offset, text=s['name'], fill="white", font=("Courier", 14), anchor=tk.W)
             self.canvas.create_text(300, y_offset, text=f"{s['avg_rank']:.2f}", fill="white", font=("Courier", 14), anchor=tk.W)
             
-            # Dynamic Survival Bar (now mathematically safe!)
+
             bar_width = (s['avg_surv'] / max_surv) * bar_max_width
             self.canvas.create_rectangle(420, y_offset-12, 420+bar_width, y_offset+12, fill=s['color'], outline="")
             self.canvas.create_text(420+bar_width+10, y_offset, text=f"{s['avg_surv']:.1f} ticks", fill="white", font=("Courier", 10), anchor=tk.W)
             
             y_offset += 40
 
-    def finalize_tournament(self, stats, rounds):
+    def finalize_tournament(self, _engine_secure_stats_v9, rounds):
         self.btn_tourney.config(state=tk.NORMAL) # Unlock the button!
         
-        summary = []
-        for name, data in stats.items():
+        _engine_secure_summary_v9 = []
+        for name, data in _engine_secure_stats_v9.items():
             ranks = data['ranks']
             survivals = data['survivals']
-            summary.append({
+            _engine_secure_summary_v9.append({
                 "name": name,
                 "total_rank": sum(ranks),
                 "avg_rank": sum(ranks) / max(1, len(ranks)),
                 "total_survival": sum(survivals)
             })
             
-        summary.sort(key=lambda x: (x['total_rank'], -x['total_survival']))
+        _engine_secure_summary_v9.sort(key=lambda x: (x['total_rank'], -x['total_survival']))
 
         res_win = tk.Toplevel(self.root)
         res_win.title("Tournament Results")
@@ -620,7 +654,7 @@ class TronApp:
         header = f"{'Pos':<5} | {'Bot Name':<25} | {'Score (Ranks)':<15} | {'Avg Rank':<10} | {'Tie-Breaker (Survival)':<25}\n"
         text_widget.insert(tk.END, header + "-" * len(header) + "\n")
         
-        for i, row in enumerate(summary, 1):
+        for i, row in enumerate(_engine_secure_summary_v9, 1):
             text_widget.insert(tk.END, f"{i:<5} | {row['name']:<25} | {row['total_rank']:<15} | {row['avg_rank']:<10.2f} | {row['total_survival']:<25}\n")
             
         text_widget.config(state=tk.DISABLED)
