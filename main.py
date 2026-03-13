@@ -116,13 +116,10 @@ if __name__ == "__main__":
     main()
 """
 
-import ast
-
 # --- SECURITY SCANNER ---
 def is_bot_safe(filepath):
     """Scans a python file for syntax errors, blatant illegal concepts, and network calls."""
     
-    # ADDED: Network and web modules (socket, urllib, http, etc.)
     banned_modules = [
         'os', 'sys', 'subprocess', 'inspect', 'threading', 'multiprocessing', 
         'builtins', 'shutil', 'importlib', 'ctypes', 'pathlib', 'io', 
@@ -130,13 +127,11 @@ def is_bot_safe(filepath):
         'requests', 'xmlrpc', 'ftplib', 'telnetlib', 'asyncio', 'pickle', 'marshal'
     ]
     
-    # ADDED: dir, vars, type (used to inspect engine objects)
     banned_functions = [
         'exec', 'eval', 'compile', 'open', 'globals', 'locals', 
         'getattr', 'setattr', 'delattr', '__import__', 'dir', 'vars', 'type'
     ]
     
-    # ADDED: __getattribute__ (The main way to smuggle string-based bans)
     banned_attributes = [
         '__traceback__', 'tb_frame', 'f_back', 'f_locals', 'f_globals', 
         '__dict__', '__class__', '__subclasses__', '__builtins__', '__code__',
@@ -159,10 +154,17 @@ def is_bot_safe(filepath):
                 if node.module and node.module.split('.')[0] in banned_modules:
                         return False, f"Banned Import: '{node.module}' is restricted."
                         
-            # Block Banned Functions (eval(), open())
-            elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in banned_functions:
-                    return False, f"Banned Function: '{node.func.id}()' is restricted."
+            # --- THE FIX: Check AST Names instead of AST Calls ---
+            elif isinstance(node, ast.Name):
+                # Blocks assignments like `get_module = __import__` 
+                # and standalone references like `print(open)`
+                if node.id in banned_functions:
+                    return False, f"Banned Identifier: '{node.id}' usage is restricted."
+                
+                # Also blocks users from accessing __builtins__ directly as a name 
+                # instead of just as an attribute
+                if node.id in banned_attributes:
+                    return False, f"Banned Identifier: '{node.id}' usage is restricted."
                     
             # Block Banned Attributes (obj.__dict__, obj.__class__)
             elif isinstance(node, ast.Attribute):
