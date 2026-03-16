@@ -1,6 +1,6 @@
 import collections
 
-team_name = "botthing"
+team_name = "Bot Thing"
 
 def get_safe_moves(pos, board, grid_dim):
     """Returns a list of safe neighboring coordinates."""
