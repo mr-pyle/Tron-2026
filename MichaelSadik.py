@@ -1,7 +1,7 @@
 import random
 from collections import deque
 
-team_name = "The Paladin"
+team_name = "MichaelSadik"
 
 def get_open_neighbors(pos, board, grid_dim):
     """Returns a list of safe, open adjacent coordinates."""
