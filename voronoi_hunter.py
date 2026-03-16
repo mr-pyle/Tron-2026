@@ -1,7 +1,7 @@
 import random
 from collections import deque
 
-team_name = "Voronoi Hunter"
+team_name = "VoronoiHunter"
 
 def move(my_pos, board, grid_dim, players):
     x, y = my_pos
