@@ -1,4 +1,4 @@
-team_name = "lexibot"
+team_name = "lexi bot"
 
 DIRECTIONS = {
     "UP":    (0, -1),
