@@ -636,7 +636,7 @@ class TronApp:
     def refresh_bot_list(self):
         for widget in self.bot_scroll_frame.winfo_children(): widget.destroy()
         
-        current_files = sorted([f[:-3] for f in os.listdir('.') if f.endswith('.py') and f != 'main.py'])
+        current_files = sorted([f[:-3] for f in os.listdir('.') if f.endswith('.py') and f != 'main.py' and f != 'network_test.py'])
         new_vars = {}
         total_bots = len(current_files)
         
