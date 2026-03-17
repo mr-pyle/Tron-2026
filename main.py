@@ -381,12 +381,16 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
                 "trail": list(other_p['trail'])
             })
 
-        # --- PHASE 1: GATHER INTENTIONS ---
+        # --- PHASE 1: GATHER INTENTIONS (CONCURRENTLY!) ---
         intended_moves = {}
-        for p in alive:
-            p['survival'] += 1
+        
+        # Helper function to run in a background I/O thread
+        def fetch_move_headless(p):
+            import time
+            start_time = time.perf_counter()
             try:
                 move = p['move_func'](p['pos'], _engine_board.copy(), grid_dim, safe_players)
+                think_time = time.perf_counter() - start_time
                 if move not in ["UP", "DOWN", "LEFT", "RIGHT"]:
                     raise ValueError(f"Illegal Move Command: {move}")
                 
@@ -396,12 +400,34 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
                 elif move == "LEFT": x -= 1
                 elif move == "RIGHT": x += 1
                 
-                intended_moves[p['id']] = (x, y)
-            except Exception:
-                intended_moves[p['id']] = "ERROR" 
-                p['alive'] = False
-                _dead_player_ids.add(p['id']) 
-                p['rank'] = current_rank_score
+                return p['id'], (x, y), None, think_time
+            except Exception as e:
+                think_time = time.perf_counter() - start_time
+                return p['id'], "ERROR", e, think_time
+
+        # Ask ALL bots for their move at the exact same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alive)) as executor:
+            futures = [executor.submit(fetch_move_headless, p) for p in alive]
+            
+            for future in concurrent.futures.as_completed(futures):
+                pid, result, error, think_time = future.result()
+                
+                # Find the matching player in the main thread
+                p = next(player for player in alive if player['id'] == pid)
+                p['survival'] += 1
+                
+                # --- NEW: Track total computation time ---
+                p['total_time'] = p.get('total_time', 0.0) + think_time
+                p['move_count'] = p.get('move_count', 0) + 1
+                # -----------------------------------------
+                
+                if result == "ERROR":
+                    intended_moves[p['id']] = "ERROR" 
+                    p['alive'] = False
+                    _dead_player_ids.add(p['id']) 
+                    p['rank'] = current_rank_score
+                else:
+                    intended_moves[p['id']] = result
 
         # --- PHASE 2: COUNT CLAIMS ON EACH SQUARE ---
         square_claims = {}
@@ -453,7 +479,12 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
 
     _engine_secure_results_v9 = {}
     for p in _engine_players:
-        _engine_secure_results_v9[p['name']] = {'rank': p['rank'], 'survival': p['survival']}
+        _engine_secure_results_v9[p['name']] = {
+            'rank': p['rank'], 
+            'survival': p['survival'],
+            'total_time': p.get('total_time', 0.0),
+            'move_count': p.get('move_count', 0)
+        }
         
     return _engine_secure_results_v9
 
@@ -522,9 +553,6 @@ class TronApp:
                         
         self.show_names_var = tk.BooleanVar(value=False)
         tk.Checkbutton(vis_frame, text="Show Display Names", variable=self.show_names_var, bg=SIDEBAR_BG, fg=TEXT_COLOR, selectcolor=DARK_BG, activeforeground="white", highlightthickness=0, bd=0).pack(fill=tk.X, padx=10, pady=2)
-
-        self.show_heatmap_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(vis_frame, text="Territory Heatmap", variable=self.show_heatmap_var, bg=SIDEBAR_BG, fg=TEXT_COLOR, selectcolor=DARK_BG, activeforeground="white", highlightthickness=0, bd=0).pack(fill=tk.X, padx=10, pady=2)
 
         self.speed_var = tk.DoubleVar(value=1.0)
         tk.Scale(vis_frame, from_=0.25, to=25.0, resolution=0.25, variable=self.speed_var, orient=tk.HORIZONTAL, bg=SIDEBAR_BG, fg=TEXT_COLOR, label="Speed").pack(fill=tk.X, padx=10)
@@ -756,6 +784,20 @@ class TronApp:
             self._engine_board[pos] = i + 1
 
     def start_visual_match(self):
+        # --- AUTO-SCALE THE BOARD ---
+        # 1. Measure the current size of the dark gray frame on the right
+        frame_width = self.canvas_frame.winfo_width()
+        frame_height = self.canvas_frame.winfo_height()
+        
+        # 2. Find the shortest side so the board stays a perfect square (leaving a tiny 20px margin)
+        available_space = min(frame_width, frame_height) - 20
+        
+        # 3. Mathematically calculate the new cell size (Tkinter handles decimals perfectly!)
+        self.cell_size = available_space / self.grid_dim
+        
+        # 4. Resize the canvas to perfectly wrap the new grid
+        self.canvas.config(width=self.grid_dim * self.cell_size, height=self.grid_dim * self.cell_size)
+
         selected = [bot for bot, var in self.available_bots.items() if var.get()]
         if len(selected) < 2: return messagebox.showwarning("Error", "Select at least 2 bots!")
 
@@ -779,12 +821,6 @@ class TronApp:
         # Transform the checkboxes into the live scoreboard!
         self.refresh_bot_sidebar()
 
-        if self.show_heatmap_var.get():
-            self.dim_colors = {p['id']: get_dim_color(p['color']) for p in self._engine_players}
-            for x in range(self.grid_dim):
-                for y in range(self.grid_dim):
-                    self.canvas.create_rectangle(x*self.cell_size, y*self.cell_size, (x+1)*self.cell_size, (y+1)*self.cell_size, fill=DARK_BG, outline="", tags=f"bg_cell_{x}_{y}")
-
         for i in range(0, self.grid_dim * self.cell_size, self.cell_size):
             self.canvas.create_line(i, 0, i, self.grid_dim*self.cell_size, fill="#111", tags="grid")
             self.canvas.create_line(0, i, self.grid_dim*self.cell_size, i, fill="#111", tags="grid")
@@ -798,21 +834,6 @@ class TronApp:
 
         self.running = True
         self.game_loop()
-
-    def update_heatmap(self):
-        alive_players = [p for p in self._engine_players if p['alive']]
-        if not alive_players: return
-
-        for x in range(self.grid_dim):
-            for y in range(self.grid_dim):
-                if (x, y) not in self._engine_board:
-                    min_dist = float('inf')
-                    owner_id = None
-                    for p in alive_players:
-                        px, py = p['pos']
-                        dist = abs(x - px) + abs(y - py)
-                        if dist < min_dist: min_dist, owner_id = dist, p['id']
-                    if owner_id: self.canvas.itemconfig(f"bg_cell_{x}_{y}", fill=self.dim_colors[owner_id])
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -851,13 +872,15 @@ class TronApp:
         for other_p in self._engine_players:
             safe_players.append({"id": other_p['id'], "name": other_p['name'], "pos": other_p['pos'], "alive": other_p['alive'], "trail": list(other_p['trail'])})
 
-        # --- PHASE 1: GATHER INTENTIONS ---
+        # --- PHASE 1: GATHER INTENTIONS (CONCURRENTLY!) ---
         intended_moves = {}
-        for p in alive:
-            p['survival'] += 1
+        
+        # Helper function to run in a background I/O thread
+        def fetch_move(p):
             try:
                 move = p['move_func'](p['pos'], self._engine_board.copy(), self.grid_dim, safe_players)
-                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]: raise ValueError(f"Illegal Move Command: {move}")
+                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]: 
+                    raise ValueError(f"Illegal Move Command: {move}")
                 
                 nx, ny = p['pos']
                 if move == "UP": ny -= 1
@@ -865,16 +888,32 @@ class TronApp:
                 elif move == "LEFT": nx -= 1
                 elif move == "RIGHT": nx += 1
                 
-                intended_moves[p['id']] = (nx, ny)
+                return p['id'], (nx, ny), None
             except Exception as e:
-                print(f"[ENGINE FATAL]: Bot {p['name']} died because: {repr(e)}")
-                intended_moves[p['id']] = "ERROR"
-                p['alive'] = False
-                self._dead_player_ids.add(p['id']) 
-                p['rank'] = current_rank_score
-                if visual:
-                    self.canvas.itemconfig(f"p{p['id']}", fill=get_dead_color(p['color']))
-                    self.canvas.delete(f"name_{p['id']}")
+                return p['id'], "ERROR", e
+                
+        # Ask ALL bots for their move at the exact same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alive)) as executor:
+            futures = [executor.submit(fetch_move, p) for p in alive]
+            
+            for future in concurrent.futures.as_completed(futures):
+                pid, result, error = future.result()
+                
+                # Find the matching player in the main thread
+                p = next(player for player in alive if player['id'] == pid)
+                p['survival'] += 1
+                
+                if result == "ERROR":
+                    print(f"[ENGINE FATAL]: Bot {p['name']} died because: {repr(error)}")
+                    intended_moves[p['id']] = "ERROR"
+                    p['alive'] = False
+                    self._dead_player_ids.add(p['id']) 
+                    p['rank'] = current_rank_score
+                    if visual:
+                        self.canvas.itemconfig(f"p{p['id']}", fill=get_dead_color(p['color']))
+                        self.canvas.delete(f"name_{p['id']}")
+                else:
+                    intended_moves[p['id']] = result
 
         # --- PHASE 2: COUNT CLAIMS ON EACH SQUARE ---
         square_claims = {}
@@ -937,9 +976,6 @@ class TronApp:
                     self.canvas.delete(f"name_{p['id']}")
                     if self.show_names_var.get():
                         self.canvas.create_text(nx*self.cell_size + self.cell_size + 5, ny*self.cell_size, text=p['name'], fill="white", font=("Arial", max(8, self.cell_size)), anchor=tk.W, tags=f"name_{p['id']}")
-
-        if visual and self.show_heatmap_var.get() and self._engine_players[0]['survival'] % 3 == 0:
-            self.update_heatmap()
             
         # UPDATE THE UI IF SOMEONE JUST DIED
         if visual and len(self._dead_player_ids) > dead_count_start:
@@ -1005,6 +1041,9 @@ class TronApp:
                         for name, data in result.items():
                             _engine_secure_stats_v9[name]['ranks'].append(data['rank'])
                             _engine_secure_stats_v9[name]['survivals'].append(data['survival'])
+                            # --- NEW: Accumulate time across all rounds ---
+                            _engine_secure_stats_v9[name]['total_time'] = _engine_secure_stats_v9[name].get('total_time', 0.0) + data['total_time']
+                            _engine_secure_stats_v9[name]['move_count'] = _engine_secure_stats_v9[name].get('move_count', 0) + data['move_count']
                         self.root.after(0, self.draw_tournament_progress, _engine_secure_stats_v9, completed, rounds)
                     except Exception as e:
                         print(f"Match error on a worker thread: {e}")
@@ -1054,7 +1093,19 @@ class TronApp:
         _engine_secure_summary_v9 = []
         for name, data in _engine_secure_stats_v9.items():
             ranks, survivals = data['ranks'], data['survivals']
-            _engine_secure_summary_v9.append({"name": name, "total_rank": sum(ranks), "avg_rank": sum(ranks) / max(1, len(ranks)), "total_survival": sum(survivals)})
+            
+            # --- NEW: Calculate Average Time per Move in milliseconds ---
+            total_time = data.get('total_time', 0.0)
+            move_count = data.get('move_count', 0)
+            avg_time_ms = (total_time / max(1, move_count)) * 1000 
+            
+            _engine_secure_summary_v9.append({
+                "name": name, 
+                "total_rank": sum(ranks), 
+                "avg_rank": sum(ranks) / max(1, len(ranks)), 
+                "total_survival": sum(survivals),
+                "avg_time_ms": avg_time_ms
+            })
             
         _engine_secure_summary_v9.sort(key=lambda x: (x['total_rank'], -x['total_survival']))
 
@@ -1075,11 +1126,17 @@ class TronApp:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         text_widget.config(yscrollcommand=sb.set)
         
-        header = f"{'Pos':<5} | {'Bot Name':<25} | {'Score (Ranks)':<15} | {'Avg Rank':<10} | {'Tie-Breaker (Survival)':<25}\n"
-        text_widget.insert(tk.END, header + "-" * len(header) + "\n")
+        # --- NEW: Add the Avg Time/Move column to the header and rows ---
+        header = f"{'Pos':<5} | {'Bot Name':<25} | {'Score (Ranks)':<15} | {'Avg Rank':<10} | {'Tie-Breaker':<15} | {'Avg Time/Move':<15}\n"
+        text_widget.insert(tk.END, header)
+        text_widget.insert(tk.END, "-" * 105 + "\n")
         
-        for i, row in enumerate(_engine_secure_summary_v9, 1):
-            text_widget.insert(tk.END, f"{i:<5} | {row['name']:<25} | {row['total_rank']:<15} | {row['avg_rank']:<10.2f} | {row['total_survival']:<25}\n")
+        for i, p in enumerate(_engine_secure_summary_v9):
+            pos_str = f"#{i+1}"
+            avg_rk_str = f"{p['avg_rank']:.2f}"
+            time_str = f"{p['avg_time_ms']:.2f} ms"
+            line = f"{pos_str:<5} | {p['name']:<25} | {p['total_rank']:<15} | {avg_rk_str:<10} | {p['total_survival']:<15} | {time_str:<15}\n"
+            text_widget.insert(tk.END, line)
             
         text_widget.config(state=tk.DISABLED)
 
