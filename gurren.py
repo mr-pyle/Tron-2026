@@ -1,6 +1,6 @@
 import collections
 
-team_name = "TengenToppa_Kizuna"
+team_name = "TengenToppa"
 
 # =========================================================================
 # INTRA-MATCH MEMORY
