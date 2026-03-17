@@ -76,6 +76,10 @@ def main():
     except Exception:
         return
 
+    # THE FIX: Persistent local memory so we don't have to send the whole board every tick
+    local_board = {}
+    local_players = {}
+
     while True:
         line = sys.stdin.readline()
         if not line:
@@ -84,31 +88,45 @@ def main():
         try:
             state = json.loads(line)
             
-            # --- LIGHTNING FAST JSON RECONSTRUCTION ---
-            # 1. Rebuild the board as a dictionary with tuple keys
-            reconstructed_board = {tuple(pos): 1 for pos in state["board_coords"]}
+            # --- LIGHTNING FAST DELTA RECONSTRUCTION ---
+            # 1. Apply only the new walls to our local board
+            for coord in state["new_board"]:
+                local_board[tuple(coord)] = 1
+                
+            # 2. Apply only the new trail steps to our local players
+            safe_players_list = []
+            for p in state["players"]:
+                pid = p["id"]
+                if p["is_new"]:
+                    local_players[pid] = {
+                        "id": pid, 
+                        "name": p["name"], 
+                        "pos": tuple(p["pos"]), 
+                        "alive": p["alive"], 
+                        "trail": [tuple(t) for t in p["new_trail"]]
+                    }
+                else:
+                    local_players[pid]["pos"] = tuple(p["pos"])
+                    local_players[pid]["alive"] = p["alive"]
+                    for t in p["new_trail"]:
+                        local_players[pid]["trail"].append(tuple(t))
+                
+                # Copy the dictionary so student bots can't corrupt the runner's memory
+                safe_players_list.append(local_players[pid].copy())
             
-            # 2. Fix the player's own position
             my_pos = tuple(state["pos"])
-            
-            # 3. Fix the opponents' positions and trails
-            for p in state["safe_players"]:
-                p["pos"] = tuple(p["pos"])
-                p["trail"] = [tuple(t) for t in p["trail"]]
             
             move = bot_module.move(
                 my_pos, 
-                reconstructed_board, 
+                local_board.copy(), 
                 state["dim"], 
-                state["safe_players"]
+                safe_players_list
             )
             
-            # Use chr(10) to guarantee a flawless newline byte over the pipe
             student_stdout.write(str(move) + chr(10))
             student_stdout.flush()
             
         except Exception as e:
-            # If the student's bot crashes, force it to go UP
             student_stdout.write("UP" + chr(10))
             student_stdout.flush()
 
@@ -181,6 +199,11 @@ class SecureBotProcess:
         self.name = name
         self.alive = True
         
+        # --- THE FIX: Persistent Thread & State Tracking ---
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.last_board_len = 0
+        self.last_trail_lens = {}
+        
         # --- SELF-HEALING PROTOCOL ---
         if snapshots and name in snapshots:
             filepath = f"{name}.py"
@@ -200,30 +223,50 @@ class SecureBotProcess:
                     f.write(pristine_code)
         # -----------------------------
         
-        # Start the "Ghost Runner" in a separate process
         self.process = subprocess.Popen(
             [sys.executable, "-c", RUNNER_CODE, bot_filename],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1 # Line buffered
+            bufsize=1 
         )
 
     def get_move(self, pos, board, dim, safe_players, timeout=2.0):
         if not self.alive:
             return "DEAD"
 
-        # 1. Prepare the game state (Send board as a flat list of coordinates to save overhead)
+        # --- THE FIX: DELTA PACKAGING ---
+        # Python 3 guarantees dictionary insertion order.
+        # We slice the board to only grab the coordinates added since the last tick!
+        current_board_coords = list(board.keys())
+        new_board = current_board_coords[self.last_board_len:]
+        self.last_board_len = len(current_board_coords)
+        
+        player_deltas = []
+        for p in safe_players:
+            pid = p["id"]
+            last_len = self.last_trail_lens.get(pid, 0)
+            new_trail = p["trail"][last_len:]
+            self.last_trail_lens[pid] = len(p["trail"])
+            
+            player_deltas.append({
+                "id": pid,
+                "name": p["name"],
+                "pos": p["pos"],
+                "alive": p["alive"],
+                "new_trail": new_trail,
+                "is_new": last_len == 0
+            })
+
         state = {
             "pos": pos,
-            "board_coords": list(board.keys()), 
-            "dim": dim,
-            "safe_players": safe_players
+            "new_board": new_board,
+            "players": player_deltas,
+            "dim": dim
         }
         
         try:
-            # Send the state to the bot's subprocess
             self.process.stdin.write(json.dumps(state) + "\n")
             self.process.stdin.flush()
         except Exception:
@@ -237,24 +280,24 @@ class SecureBotProcess:
             except Exception:
                 return "ERROR"
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            try:
-                # Give bots exactly 0.1 seconds to respond
-                future = executor.submit(read_pipe)
-                move = future.result(timeout=timeout) 
-                return move
-            except concurrent.futures.TimeoutError:
-                print(f"[{self.name}] TIMED OUT! Terminating process.")
-                self.stop()
-                return "DEAD"
-            except Exception:
-                self.stop()
-                return "DEAD"
+        try:
+            # Re-use the persistent thread pool instead of spawning a new one
+            future = self.executor.submit(read_pipe)
+            move = future.result(timeout=timeout) 
+            return move
+        except concurrent.futures.TimeoutError:
+            print(f"[{self.name}] TIMED OUT! Terminating process.")
+            self.stop()
+            return "DEAD"
+        except Exception:
+            self.stop()
+            return "DEAD"
 
     def stop(self):
         self.alive = False
         try:
             self.process.kill()
+            self.executor.shutdown(wait=False) # Safely release the persistent thread
         except Exception:
             pass
 
@@ -338,12 +381,16 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
                 "trail": list(other_p['trail'])
             })
 
-        # --- PHASE 1: GATHER INTENTIONS ---
+        # --- PHASE 1: GATHER INTENTIONS (CONCURRENTLY!) ---
         intended_moves = {}
-        for p in alive:
-            p['survival'] += 1
+        
+        # Helper function to run in a background I/O thread
+        def fetch_move_headless(p):
+            import time
+            start_time = time.perf_counter()
             try:
                 move = p['move_func'](p['pos'], _engine_board.copy(), grid_dim, safe_players)
+                think_time = time.perf_counter() - start_time
                 if move not in ["UP", "DOWN", "LEFT", "RIGHT"]:
                     raise ValueError(f"Illegal Move Command: {move}")
                 
@@ -353,12 +400,34 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
                 elif move == "LEFT": x -= 1
                 elif move == "RIGHT": x += 1
                 
-                intended_moves[p['id']] = (x, y)
-            except Exception:
-                intended_moves[p['id']] = "ERROR" 
-                p['alive'] = False
-                _dead_player_ids.add(p['id']) 
-                p['rank'] = current_rank_score
+                return p['id'], (x, y), None, think_time
+            except Exception as e:
+                think_time = time.perf_counter() - start_time
+                return p['id'], "ERROR", e, think_time
+
+        # Ask ALL bots for their move at the exact same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alive)) as executor:
+            futures = [executor.submit(fetch_move_headless, p) for p in alive]
+            
+            for future in concurrent.futures.as_completed(futures):
+                pid, result, error, think_time = future.result()
+                
+                # Find the matching player in the main thread
+                p = next(player for player in alive if player['id'] == pid)
+                p['survival'] += 1
+                
+                # --- NEW: Track total computation time ---
+                p['total_time'] = p.get('total_time', 0.0) + think_time
+                p['move_count'] = p.get('move_count', 0) + 1
+                # -----------------------------------------
+                
+                if result == "ERROR":
+                    intended_moves[p['id']] = "ERROR" 
+                    p['alive'] = False
+                    _dead_player_ids.add(p['id']) 
+                    p['rank'] = current_rank_score
+                else:
+                    intended_moves[p['id']] = result
 
         # --- PHASE 2: COUNT CLAIMS ON EACH SQUARE ---
         square_claims = {}
@@ -410,7 +479,12 @@ def headless_worker(grid_dim, selected_bots, code_snapshots):
 
     _engine_secure_results_v9 = {}
     for p in _engine_players:
-        _engine_secure_results_v9[p['name']] = {'rank': p['rank'], 'survival': p['survival']}
+        _engine_secure_results_v9[p['name']] = {
+            'rank': p['rank'], 
+            'survival': p['survival'],
+            'total_time': p.get('total_time', 0.0),
+            'move_count': p.get('move_count', 0)
+        }
         
     return _engine_secure_results_v9
 
@@ -438,38 +512,27 @@ class TronApp:
         self.setup_layout()
         self.refresh_bot_list()
 
+    def select_all_bots(self):
+        # Loop through all the checkbox variables and set them to True (checked)
+        for var in self.available_bots.values():
+            var.set(True)
+
+    def deselect_all_bots(self):
+        # Loop through all the checkbox variables and set them to False (unchecked)
+        for var in self.available_bots.values():
+            var.set(False)
+
     def setup_layout(self):
         self.sidebar = tk.Frame(self.root, width=280, bg=SIDEBAR_BG)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
         self.sidebar.pack_propagate(False)
 
+        # 1. TOP LABEL
         tk.Label(self.sidebar, text="TRON ENGINE", bg=SIDEBAR_BG, fg=ACCENT, font=("Courier", 18, "bold")).pack(pady=15)
 
-        tk.Label(self.sidebar, text="Available Bots", bg=SIDEBAR_BG, fg="gray").pack(anchor=tk.W, padx=10)
-        self.bot_scroll_frame = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
-        self.bot_scroll_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
-        tk.Button(self.sidebar, text="REFRESH & SCAN", command=self.refresh_bot_list, bg="#21262d", fg=TEXT_COLOR).pack(fill=tk.X, padx=10, pady=5)
-
-        vis_frame = tk.LabelFrame(self.sidebar, text="Visual Match", bg=SIDEBAR_BG, fg="gray")
-        vis_frame.pack(fill=tk.X, padx=10, pady=5)
-        tk.Button(vis_frame, text="START VISUAL", command=self.start_visual_match, bg="#238636", fg="white").pack(fill=tk.X, padx=10, pady=2)
-        self.btn_pause = tk.Button(vis_frame, text="PAUSE", command=self.toggle_pause, bg="#21262d", fg=TEXT_COLOR)
-        self.btn_pause.pack(fill=tk.X, padx=10, pady=2)
-        self.btn_step = tk.Button(vis_frame, text="STEP FORWARD", command=self.step_forward, bg="#444c56", fg="white", state=tk.DISABLED)
-        self.btn_step.pack(fill=tk.X, padx=10, pady=2)
-                        
-        self.show_names_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(vis_frame, text="Show Display Names", variable=self.show_names_var, bg=SIDEBAR_BG, fg=TEXT_COLOR, selectcolor=DARK_BG, activeforeground="white", highlightthickness=0, bd=0).pack(fill=tk.X, padx=10, pady=2)
-
-        self.show_heatmap_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(vis_frame, text="Territory Heatmap", variable=self.show_heatmap_var, bg=SIDEBAR_BG, fg=TEXT_COLOR, selectcolor=DARK_BG, activeforeground="white", highlightthickness=0, bd=0).pack(fill=tk.X, padx=10, pady=2)
-
-        self.speed_var = tk.DoubleVar(value=1.0)
-        tk.Scale(vis_frame, from_=0.25, to=25.0, resolution=0.25, variable=self.speed_var, orient=tk.HORIZONTAL, bg=SIDEBAR_BG, fg=TEXT_COLOR, label="Speed").pack(fill=tk.X, padx=10)
-
+        # 2. BOTTOM CONTROLS (Packed in reverse order from bottom up)
         tour_frame = tk.LabelFrame(self.sidebar, text="Tournament (Headless)", bg=SIDEBAR_BG, fg="gray")
-        tour_frame.pack(fill=tk.X, padx=10, pady=10)
+        tour_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10) # Packed to BOTTOM
         
         r_frame = tk.Frame(tour_frame, bg=SIDEBAR_BG)
         r_frame.pack(fill=tk.X, padx=10, pady=2)
@@ -479,9 +542,95 @@ class TronApp:
         self.btn_tourney = tk.Button(tour_frame, text="RUN TOURNAMENT", command=self.start_tournament, bg="#a371f7", fg="white")
         self.btn_tourney.pack(fill=tk.X, padx=10, pady=5)
 
+        vis_frame = tk.LabelFrame(self.sidebar, text="Visual Match", bg=SIDEBAR_BG, fg="gray")
+        vis_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5) # Packed to BOTTOM
+        
+        tk.Button(vis_frame, text="START VISUAL", command=self.start_visual_match, bg="#238636", fg="white").pack(fill=tk.X, padx=10, pady=2)
+        self.btn_pause = tk.Button(vis_frame, text="PAUSE", command=self.toggle_pause, bg="#21262d", fg=TEXT_COLOR)
+        self.btn_pause.pack(fill=tk.X, padx=10, pady=2)
+        self.btn_step = tk.Button(vis_frame, text="STEP FORWARD", command=self.step_forward, bg="#444c56", fg="white", state=tk.DISABLED)
+        self.btn_step.pack(fill=tk.X, padx=10, pady=2)
+                        
+        self.show_names_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(vis_frame, text="Show Display Names", variable=self.show_names_var, bg=SIDEBAR_BG, fg=TEXT_COLOR, selectcolor=DARK_BG, activeforeground="white", highlightthickness=0, bd=0).pack(fill=tk.X, padx=10, pady=2)
+
+        self.speed_var = tk.DoubleVar(value=1.0)
+        tk.Scale(vis_frame, from_=0.25, to=25.0, resolution=0.25, variable=self.speed_var, orient=tk.HORIZONTAL, bg=SIDEBAR_BG, fg=TEXT_COLOR, label="Speed").pack(fill=tk.X, padx=10)
+
+        tk.Button(self.sidebar, text="REFRESH & SCAN", command=self.refresh_bot_list, bg="#21262d", fg=TEXT_COLOR).pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5) # Packed to BOTTOM
+
+        # 3. MIDDLE SCROLLABLE AREA (Takes up remaining space)
+        tk.Label(self.sidebar, text="Available Bots", bg=SIDEBAR_BG, fg="gray").pack(anchor=tk.W, padx=10)
+        
+        # --- SELECT / DESELECT BUTTONS ---
+        selection_btn_frame = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
+        selection_btn_frame.pack(fill=tk.X, padx=10, pady=(0, 5))
+
+        btn_select_all = tk.Button(selection_btn_frame, text="Select All", bg="#2ea043", fg="white", command=self.select_all_bots, relief=tk.FLAT, font=("Courier", 9, "bold"))
+        btn_select_all.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+
+        btn_deselect_all = tk.Button(selection_btn_frame, text="Deselect All", bg="#da3633", fg="white", command=self.deselect_all_bots, relief=tk.FLAT, font=("Courier", 9, "bold"))
+        btn_deselect_all.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(5, 0))
+        # ---------------------------------
+
+        # --- SCROLLABLE BOT LIST ---
+        # 1. Container for the Canvas and Scrollbar
+        self.bot_container = tk.Frame(self.sidebar, bg=SIDEBAR_BG)
+        self.bot_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # 2. The Canvas & Scrollbar
+        self.bot_canvas = tk.Canvas(self.bot_container, bg=SIDEBAR_BG, highlightthickness=0)
+        self.bot_scrollbar = tk.Scrollbar(self.bot_container, orient="vertical", command=self.bot_canvas.yview)
+        
+        # 3. The Inner Frame (Where the bots actually go)
+        self.bot_scroll_frame = tk.Frame(self.bot_canvas, bg=SIDEBAR_BG)
+        
+        # 4. Bindings & Packing
+        self.bot_scroll_frame.bind(
+            "<Configure>",
+            lambda e: self.bot_canvas.configure(scrollregion=self.bot_canvas.bbox("all"))
+        )
+        
+        self.canvas_window = self.bot_canvas.create_window((0, 0), window=self.bot_scroll_frame, anchor="nw")
+        
+        self.bot_canvas.bind(
+            '<Configure>', 
+            lambda e: self.bot_canvas.itemconfig(self.canvas_window, width=e.width)
+        )
+        
+        self.bot_canvas.configure(yscrollcommand=self.bot_scrollbar.set)
+        
+        self.bot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.bot_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # --- MOUSE WHEEL SCROLLING ---
+        def _on_mousewheel(event):
+            self.bot_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
+        def _bind_mousewheel(event):
+            self.bot_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            self.bot_canvas.bind_all("<Button-4>", lambda e: self.bot_canvas.yview_scroll(-1, "units"))
+            self.bot_canvas.bind_all("<Button-5>", lambda e: self.bot_canvas.yview_scroll(1, "units"))
+
+        def _unbind_mousewheel(event):
+            self.bot_canvas.unbind_all("<MouseWheel>")
+            self.bot_canvas.unbind_all("<Button-4>")
+            self.bot_canvas.unbind_all("<Button-5>")
+
+        self.bot_container.bind("<Enter>", _bind_mousewheel)
+        self.bot_container.bind("<Leave>", _unbind_mousewheel)
+
+        # --- 4. MAIN GAME CANVAS (Add this back!) ---
         self.canvas_frame = tk.Frame(self.root, bg=DARK_BG)
         self.canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(self.canvas_frame, width=self.grid_dim*self.cell_size, height=self.grid_dim*self.cell_size, bg="black", highlightthickness=0)
+        
+        self.canvas = tk.Canvas(
+            self.canvas_frame, 
+            width=self.grid_dim * self.cell_size, 
+            height=self.grid_dim * self.cell_size, 
+            bg="black", 
+            highlightthickness=0
+        )
         self.canvas.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
     def refresh_bot_list(self):
@@ -535,6 +684,67 @@ class TronApp:
             
         self.available_bots = new_vars
 
+    def refresh_bot_sidebar(self):
+        # 1. Clear the existing widgets (Checkboxes) from the scrollable frame
+        for widget in self.bot_scroll_frame.winfo_children():
+            widget.destroy()
+
+        alive_bots = []
+        dead_bots = []
+
+        # 2. Categorize the bots
+        for p in self._engine_players:
+            if p['alive']:  
+                alive_bots.append(p)
+            else:
+                dead_bots.append(p)
+
+        # 3. Sort the alive bots alphabetically
+        alive_bots.sort(key=lambda x: x['name'].lower())
+        
+        # Dead bots will naturally be in the order they died!
+
+        # 4. Draw the Alive Bots at the top (Restored Original Style)
+        for p in alive_bots:
+            name = p['name']
+            bot_color = p['color']
+
+            # Create a row frame to hold the layout
+            row = tk.Frame(self.bot_scroll_frame, bg=SIDEBAR_BG)
+            row.pack(fill=tk.X, pady=1)
+
+            # 1. Recreate the Checkbox (tied to the original variable so it stays checked).
+            # We set state=tk.DISABLED so users can't uncheck a bot that is actively playing!
+            if name in self.available_bots:
+                cb = tk.Checkbutton(
+                    row, 
+                    variable=self.available_bots[name], 
+                    state=tk.DISABLED, 
+                    bg=SIDEBAR_BG, 
+                    activebackground=SIDEBAR_BG, 
+                    selectcolor=DARK_BG, 
+                    highlightthickness=0, 
+                    bd=0
+                )
+                cb.pack(side=tk.LEFT)
+
+            # 2. Recreate the square color swatch
+            swatch = tk.Canvas(row, width=12, height=12, bg=bot_color, highlightthickness=1, highlightbackground="white")
+            swatch.pack(side=tk.LEFT, padx=5)
+
+            # 3. Recreate the standard text label
+            name_label = tk.Label(row, text=name, bg=SIDEBAR_BG, fg=TEXT_COLOR, font=("Courier", 9))
+            name_label.pack(side=tk.LEFT)
+
+        # 5. Draw the Dead Bots at the bottom
+        for p in dead_bots:
+            name = p['name']
+            lbl = tk.Label(self.bot_scroll_frame, text=f"💀 {name}", bg=SIDEBAR_BG, fg="#666666", font=("Courier", 10))
+            lbl.pack(anchor=tk.W, pady=2, padx=5)
+            
+        # 6. Update the canvas scroll region
+        self.bot_canvas.configure(scrollregion=self.bot_canvas.bbox("all"))
+
     def adjust_grid_size(self, num_players):
         area_needed = max(3600, num_players * 900)
         self.grid_dim = int(math.sqrt(area_needed))
@@ -574,6 +784,20 @@ class TronApp:
             self._engine_board[pos] = i + 1
 
     def start_visual_match(self):
+        # --- AUTO-SCALE THE BOARD ---
+        # 1. Measure the current size of the dark gray frame on the right
+        frame_width = self.canvas_frame.winfo_width()
+        frame_height = self.canvas_frame.winfo_height()
+        
+        # 2. Find the shortest side so the board stays a perfect square (leaving a tiny 20px margin)
+        available_space = min(frame_width, frame_height) - 20
+        
+        # 3. Mathematically calculate the new cell size (Tkinter handles decimals perfectly!)
+        self.cell_size = available_space / self.grid_dim
+        
+        # 4. Resize the canvas to perfectly wrap the new grid
+        self.canvas.config(width=self.grid_dim * self.cell_size, height=self.grid_dim * self.cell_size)
+
         selected = [bot for bot, var in self.available_bots.items() if var.get()]
         if len(selected) < 2: return messagebox.showwarning("Error", "Select at least 2 bots!")
 
@@ -593,12 +817,9 @@ class TronApp:
         
         self.init_game_state(selected)
         self.canvas.delete("all")
-
-        if self.show_heatmap_var.get():
-            self.dim_colors = {p['id']: get_dim_color(p['color']) for p in self._engine_players}
-            for x in range(self.grid_dim):
-                for y in range(self.grid_dim):
-                    self.canvas.create_rectangle(x*self.cell_size, y*self.cell_size, (x+1)*self.cell_size, (y+1)*self.cell_size, fill=DARK_BG, outline="", tags=f"bg_cell_{x}_{y}")
+        
+        # Transform the checkboxes into the live scoreboard!
+        self.refresh_bot_sidebar()
 
         for i in range(0, self.grid_dim * self.cell_size, self.cell_size):
             self.canvas.create_line(i, 0, i, self.grid_dim*self.cell_size, fill="#111", tags="grid")
@@ -613,21 +834,6 @@ class TronApp:
 
         self.running = True
         self.game_loop()
-
-    def update_heatmap(self):
-        alive_players = [p for p in self._engine_players if p['alive']]
-        if not alive_players: return
-
-        for x in range(self.grid_dim):
-            for y in range(self.grid_dim):
-                if (x, y) not in self._engine_board:
-                    min_dist = float('inf')
-                    owner_id = None
-                    for p in alive_players:
-                        px, py = p['pos']
-                        dist = abs(x - px) + abs(y - py)
-                        if dist < min_dist: min_dist, owner_id = dist, p['id']
-                    if owner_id: self.canvas.itemconfig(f"bg_cell_{x}_{y}", fill=self.dim_colors[owner_id])
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -645,6 +851,7 @@ class TronApp:
         if self.running: self.root.after(int(100 / max(0.1, self.speed_var.get())), self.game_loop)
 
     def process_tick(self, visual=True):
+        dead_count_start = len(self._dead_player_ids)
         for p in self._engine_players:
             if p['id'] in self._dead_player_ids:
                 p['alive'] = False
@@ -665,13 +872,15 @@ class TronApp:
         for other_p in self._engine_players:
             safe_players.append({"id": other_p['id'], "name": other_p['name'], "pos": other_p['pos'], "alive": other_p['alive'], "trail": list(other_p['trail'])})
 
-        # --- PHASE 1: GATHER INTENTIONS ---
+        # --- PHASE 1: GATHER INTENTIONS (CONCURRENTLY!) ---
         intended_moves = {}
-        for p in alive:
-            p['survival'] += 1
+        
+        # Helper function to run in a background I/O thread
+        def fetch_move(p):
             try:
                 move = p['move_func'](p['pos'], self._engine_board.copy(), self.grid_dim, safe_players)
-                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]: raise ValueError(f"Illegal Move Command: {move}")
+                if move not in ["UP", "DOWN", "LEFT", "RIGHT"]: 
+                    raise ValueError(f"Illegal Move Command: {move}")
                 
                 nx, ny = p['pos']
                 if move == "UP": ny -= 1
@@ -679,16 +888,32 @@ class TronApp:
                 elif move == "LEFT": nx -= 1
                 elif move == "RIGHT": nx += 1
                 
-                intended_moves[p['id']] = (nx, ny)
+                return p['id'], (nx, ny), None
             except Exception as e:
-                print(f"[ENGINE FATAL]: Bot {p['name']} died because: {repr(e)}")
-                intended_moves[p['id']] = "ERROR"
-                p['alive'] = False
-                self._dead_player_ids.add(p['id']) 
-                p['rank'] = current_rank_score
-                if visual:
-                    self.canvas.itemconfig(f"p{p['id']}", fill=get_dead_color(p['color']))
-                    self.canvas.delete(f"name_{p['id']}")
+                return p['id'], "ERROR", e
+                
+        # Ask ALL bots for their move at the exact same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(alive)) as executor:
+            futures = [executor.submit(fetch_move, p) for p in alive]
+            
+            for future in concurrent.futures.as_completed(futures):
+                pid, result, error = future.result()
+                
+                # Find the matching player in the main thread
+                p = next(player for player in alive if player['id'] == pid)
+                p['survival'] += 1
+                
+                if result == "ERROR":
+                    print(f"[ENGINE FATAL]: Bot {p['name']} died because: {repr(error)}")
+                    intended_moves[p['id']] = "ERROR"
+                    p['alive'] = False
+                    self._dead_player_ids.add(p['id']) 
+                    p['rank'] = current_rank_score
+                    if visual:
+                        self.canvas.itemconfig(f"p{p['id']}", fill=get_dead_color(p['color']))
+                        self.canvas.delete(f"name_{p['id']}")
+                else:
+                    intended_moves[p['id']] = result
 
         # --- PHASE 2: COUNT CLAIMS ON EACH SQUARE ---
         square_claims = {}
@@ -751,9 +976,10 @@ class TronApp:
                     self.canvas.delete(f"name_{p['id']}")
                     if self.show_names_var.get():
                         self.canvas.create_text(nx*self.cell_size + self.cell_size + 5, ny*self.cell_size, text=p['name'], fill="white", font=("Arial", max(8, self.cell_size)), anchor=tk.W, tags=f"name_{p['id']}")
-
-        if visual and self.show_heatmap_var.get() and self._engine_players[0]['survival'] % 3 == 0:
-            self.update_heatmap()
+            
+        # UPDATE THE UI IF SOMEONE JUST DIED
+        if visual and len(self._dead_player_ids) > dead_count_start:
+            self.refresh_bot_sidebar()
 
     def start_tournament(self):
         selected = [bot for bot, var in self.available_bots.items() if var.get()]
@@ -815,6 +1041,9 @@ class TronApp:
                         for name, data in result.items():
                             _engine_secure_stats_v9[name]['ranks'].append(data['rank'])
                             _engine_secure_stats_v9[name]['survivals'].append(data['survival'])
+                            # --- NEW: Accumulate time across all rounds ---
+                            _engine_secure_stats_v9[name]['total_time'] = _engine_secure_stats_v9[name].get('total_time', 0.0) + data['total_time']
+                            _engine_secure_stats_v9[name]['move_count'] = _engine_secure_stats_v9[name].get('move_count', 0) + data['move_count']
                         self.root.after(0, self.draw_tournament_progress, _engine_secure_stats_v9, completed, rounds)
                     except Exception as e:
                         print(f"Match error on a worker thread: {e}")
@@ -864,7 +1093,19 @@ class TronApp:
         _engine_secure_summary_v9 = []
         for name, data in _engine_secure_stats_v9.items():
             ranks, survivals = data['ranks'], data['survivals']
-            _engine_secure_summary_v9.append({"name": name, "total_rank": sum(ranks), "avg_rank": sum(ranks) / max(1, len(ranks)), "total_survival": sum(survivals)})
+            
+            # --- NEW: Calculate Average Time per Move in milliseconds ---
+            total_time = data.get('total_time', 0.0)
+            move_count = data.get('move_count', 0)
+            avg_time_ms = (total_time / max(1, move_count)) * 1000 
+            
+            _engine_secure_summary_v9.append({
+                "name": name, 
+                "total_rank": sum(ranks), 
+                "avg_rank": sum(ranks) / max(1, len(ranks)), 
+                "total_survival": sum(survivals),
+                "avg_time_ms": avg_time_ms
+            })
             
         _engine_secure_summary_v9.sort(key=lambda x: (x['total_rank'], -x['total_survival']))
 
@@ -885,11 +1126,17 @@ class TronApp:
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         text_widget.config(yscrollcommand=sb.set)
         
-        header = f"{'Pos':<5} | {'Bot Name':<25} | {'Score (Ranks)':<15} | {'Avg Rank':<10} | {'Tie-Breaker (Survival)':<25}\n"
-        text_widget.insert(tk.END, header + "-" * len(header) + "\n")
+        # --- NEW: Add the Avg Time/Move column to the header and rows ---
+        header = f"{'Pos':<5} | {'Bot Name':<25} | {'Score (Ranks)':<15} | {'Avg Rank':<10} | {'Tie-Breaker':<15} | {'Avg Time/Move':<15}\n"
+        text_widget.insert(tk.END, header)
+        text_widget.insert(tk.END, "-" * 105 + "\n")
         
-        for i, row in enumerate(_engine_secure_summary_v9, 1):
-            text_widget.insert(tk.END, f"{i:<5} | {row['name']:<25} | {row['total_rank']:<15} | {row['avg_rank']:<10.2f} | {row['total_survival']:<25}\n")
+        for i, p in enumerate(_engine_secure_summary_v9):
+            pos_str = f"#{i+1}"
+            avg_rk_str = f"{p['avg_rank']:.2f}"
+            time_str = f"{p['avg_time_ms']:.2f} ms"
+            line = f"{pos_str:<5} | {p['name']:<25} | {p['total_rank']:<15} | {avg_rk_str:<10} | {p['total_survival']:<15} | {time_str:<15}\n"
+            text_widget.insert(tk.END, line)
             
         text_widget.config(state=tk.DISABLED)
 
