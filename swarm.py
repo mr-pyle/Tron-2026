@@ -3,6 +3,9 @@ import threading
 import json
 import struct
 import traceback
+import os
+import math
+import concurrent.futures
 from tournament import headless_worker
 
 # --- NETWORK PROTOCOL ---
@@ -10,10 +13,9 @@ def send_msg(sock, msg_dict):
     """Safely packs and sends JSON data with a 4-byte length prefix."""
     try:
         data = json.dumps(msg_dict).encode('utf-8')
-        # '>I' means Big-Endian Unsigned Integer (4 bytes)
         sock.sendall(struct.pack('>I', len(data)) + data)
     except Exception as e:
-        print(f"Send error: {e}")
+        pass
 
 def recvall(sock, n):
     """Helper to ensure we read exactly 'n' bytes."""
@@ -41,14 +43,16 @@ class SwarmServer:
     def __init__(self, update_ui_callback, match_complete_callback, tournament_complete_callback):
         self.port = 5050
         self.server_socket = None
-        self.clients = {} # {client_addr: socket}
+        self.clients = {} # {client_id: {"sock": socket, "cores": int, "pending": int}}
         self.running = False
+        self.lock = threading.Lock() # Thread safety for math operations
         
         # Tournament State
         self.target_runs = 0
         self.completed_runs = 0
         self.pending_runs = 0
         self.results = []
+        self.tourney_finished = False
         
         # Callbacks
         self.update_ui = update_ui_callback
@@ -72,7 +76,11 @@ class SwarmServer:
             try:
                 client_sock, addr = self.server_socket.accept()
                 client_id = f"{addr[0]}:{addr[1]}"
-                self.clients[client_id] = client_sock
+                
+                with self.lock:
+                    # Initialize with 1 core until handshake is received
+                    self.clients[client_id] = {"sock": client_sock, "cores": 1, "pending": 0}
+                
                 self.update_ui(f"Connected: {client_id}")
                 threading.Thread(target=self._handle_client, args=(client_sock, client_id), daemon=True).start()
             except Exception:
@@ -84,54 +92,99 @@ class SwarmServer:
                 msg = recv_msg(client_sock)
                 if not msg: break
                 
-                if msg.get("type") == "result":
-                    self.completed_runs += 1
-                    self.pending_runs -= 1  # <--- THE MISSING FIX!
-                    self.results.append(msg["data"])
-                    self.match_complete(self.completed_runs, self.target_runs)
+                # 1. The Core Handshake
+                if msg.get("type") == "handshake":
+                    with self.lock:
+                        if client_id in self.clients:
+                            self.clients[client_id]["cores"] = msg.get("cores", 1)
+                            
+                # 2. Receiving a Batch of Results
+                elif msg.get("type") == "batch_result":
+                    batch_data = msg["data"]
+                    batch_size = len(batch_data)
                     
-                    # Give them another run if we still need more
-                    if self.completed_runs + self.pending_runs < self.target_runs:
-                        self.pending_runs += 1
-                        send_msg(client_sock, {"type": "run_match"})
-                    elif self.completed_runs == self.target_runs: # Changed to exactly equal to prevent double-firing
-                        self.tourney_complete(self.results)
+                    with self.lock:
+                        self.completed_runs += batch_size
+                        self.pending_runs -= batch_size
+                        self.clients[client_id]["pending"] -= batch_size
+                        self.results.extend(batch_data) # Flatten the batch into the main list
+                        
+                        self.match_complete(self.completed_runs, self.target_runs)
+                        self._assign_work(client_id) # Ask them to do more!
                         
             except Exception as e:
-                print(f"Client error {client_id}: {e}")
                 break
                 
-        # Cleanup disconnect
-        if client_id in self.clients:
-            del self.clients[client_id]
-            self.update_ui(f"Disconnected: {client_id}")
+        # Cleanup disconnect (Resilience: Reassign lost runs if a laptop closes!)
+        with self.lock:
+            if client_id in self.clients:
+                lost_runs = self.clients[client_id]["pending"]
+                self.pending_runs -= lost_runs
+                del self.clients[client_id]
+                self.update_ui(f"Disconnected: {client_id}")
+                
+                # If they dropped matches, give them to someone else
+                if lost_runs > 0 and not self.tourney_finished:
+                    for cid in list(self.clients.keys()):
+                        self._assign_work(cid)
+                        
         client_sock.close()
+
+    def _assign_work(self, client_id):
+        """Calculates a fair chunk of matches and sends them to the client."""
+        if self.tourney_finished or client_id not in self.clients: return
+        
+        remaining = self.target_runs - (self.completed_runs + self.pending_runs)
+        
+        # Check if tournament is completely finished
+        if remaining <= 0:
+            if self.completed_runs >= self.target_runs and not self.tourney_finished:
+                self.tourney_finished = True
+                self.tourney_complete(self.results)
+            return
+            
+        # DYNAMIC BATCH MATH
+        active_clients = len(self.clients)
+        fair_chunk = math.ceil(remaining / active_clients)
+        client_cores = self.clients[client_id]["cores"]
+        
+        # Never exceed remaining matches, the client's core count, or the fair share
+        chunk = min(remaining, client_cores, fair_chunk)
+        if chunk <= 0: return
+        
+        self.pending_runs += chunk
+        self.clients[client_id]["pending"] += chunk
+        send_msg(self.clients[client_id]["sock"], {"type": "run_batch", "count": chunk})
 
     def start_tournament(self, grid_dim, selected_bots, code_snapshots, num_runs):
         if not self.clients:
             self.update_ui("Error: No clients connected!")
             return
             
-        self.target_runs = num_runs
-        self.completed_runs = 0
-        self.pending_runs = 0
-        self.results = []
+        with self.lock:
+            self.target_runs = num_runs
+            self.completed_runs = 0
+            self.pending_runs = 0
+            self.results = []
+            self.tourney_finished = False
+            for cid in self.clients:
+                self.clients[cid]["pending"] = 0
         
-        # 1. Distribute the heavy bot code to everyone
+        # 1. Distribute the bot code to everyone
         init_payload = {
             "type": "init",
             "grid_dim": grid_dim,
             "selected_bots": selected_bots,
             "code_snapshots": code_snapshots
         }
-        for sock in self.clients.values():
-            send_msg(sock, init_payload)
+        with self.lock:
+            for client_info in self.clients.values():
+                send_msg(client_info["sock"], init_payload)
             
-        # 2. Tell everyone to start running a match
-        for sock in self.clients.values():
-            if self.pending_runs < self.target_runs:
-                self.pending_runs += 1
-                send_msg(sock, {"type": "run_match"})
+        # 2. Tell everyone to start running their fair batch
+        with self.lock:
+            for client_id in list(self.clients.keys()):
+                self._assign_work(client_id)
 
     def stop(self):
         self.running = False
@@ -156,7 +209,12 @@ class SwarmClient:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((server_ip, 5050))
             self.running = True
-            self.update_ui("✅ Connected to Server!")
+            
+            # --- THE HANDSHAKE ---
+            cores = os.cpu_count() or 1
+            send_msg(self.client_socket, {"type": "handshake", "cores": cores})
+            
+            self.update_ui(f"✅ Connected! (Reported {cores} Cores)")
             threading.Thread(target=self._listen_to_server, daemon=True).start()
         except Exception as e:
             self.update_ui(f"❌ Connection failed: {e}")
@@ -174,14 +232,26 @@ class SwarmClient:
                     self.runs_completed = 0
                     self.update_ui("Received Tournament Data. Waiting for start...")
                     
-                elif msg.get("type") == "run_match":
-                    self.update_ui(f"Running Match (Total completed: {self.runs_completed})...")
-                    # Run the match locally!
-                    results = headless_worker(self.grid_dim, self.selected_bots, self.code_snapshots)
-                    self.runs_completed += 1
-                    # Send results back
-                    send_msg(self.client_socket, {"type": "result", "data": results})
-                    self.update_ui(f"Match submitted! (Total completed: {self.runs_completed})")
+                elif msg.get("type") == "run_batch":
+                    count = msg["count"]
+                    self.update_ui(f"Processing Batch of {count} Matches...")
+                    
+                    batch_results = []
+                    
+                    # --- THE MULTI-CORE THREAD POOL ---
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
+                        # Queue up the matches
+                        futures = [executor.submit(headless_worker, self.grid_dim, self.selected_bots, self.code_snapshots) for _ in range(count)]
+                        
+                        # Gather results as they finish concurrently
+                        for future in concurrent.futures.as_completed(futures):
+                            batch_results.append(future.result())
+                            self.runs_completed += 1
+                            self.update_ui(f"Processing Batch... (Total completed: {self.runs_completed})")
+                    
+                    # Send the entire batch back at once
+                    send_msg(self.client_socket, {"type": "batch_result", "data": batch_results})
+                    self.update_ui(f"Batch submitted! (Total completed: {self.runs_completed})")
                     
             except Exception as e:
                 self.update_ui(f"Server disconnected or error: {e}")
