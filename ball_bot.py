@@ -49,8 +49,8 @@ def move(my_pos, board, grid_dim, players):
 
         score = 0.0
 
-        # 1. Main feature: how much open territory can I still reach?
-        reachable = flood_fill_size(next_pos, board, grid_dim, limit=500)
+        # 1. Main feature: Voronoi reachability (replaces basic flood fill)
+        reachable = voronoi_space(next_pos, opponent_heads, board, grid_dim, limit=600)
         score += reachable * 12.0
 
         # 2. Prefer positions with more immediate exits
@@ -80,7 +80,27 @@ def move(my_pos, board, grid_dim, players):
         elif exits == 2:
             score -= 10.0
 
-        # 8. Tiny tie-breaker for deterministic preference
+        # 8. LOOKAHEAD: Simulate making the move to see next turn's options
+        my_id = my_player.get("id", 999) if my_player else 999
+        board[next_pos] = my_id  # Temporarily add our hypothetical move to the board
+        
+        future_safe_moves = 0
+        for fx, fy in DIRECTIONS.values():
+            future_pos = (next_pos[0] + fx, next_pos[1] + fy)
+            if is_safe(future_pos, board, grid_dim):
+                future_safe_moves += 1
+                
+        # Heavy penalties for moves that lead to dead-ends next turn
+        if future_safe_moves == 0:
+            score -= 1000.0  # Immediate death next turn!
+        elif future_safe_moves == 1:
+            score -= 50.0    # Forced into a corner
+        else:
+            score += future_safe_moves * 5.0 # Keep options open
+            
+        del board[next_pos] # Clean up our simulation so it doesn't break other directions
+
+        # 9. Tiny tie-breaker for deterministic preference
         score += direction_tiebreak(direction)
 
         if score > best_score:
@@ -127,25 +147,47 @@ def count_safe_neighbors(pos, board, grid_dim):
     return count
 
 
-def flood_fill_size(start, board, grid_dim, limit=500):
-    if not is_safe(start, board, grid_dim):
+def voronoi_space(start_pos, opponent_heads, board, grid_dim, limit=600):
+    """
+    Simultaneous BFS. Calculates how many cells 'start_pos' can reach 
+    STRICTLY BEFORE any opponent can reach them.
+    """
+    if not is_safe(start_pos, board, grid_dim):
         return 0
-
-    seen = {start}
-    q = deque([start])
-    total = 0
-
-    while q and total < limit:
-        x, y = q.popleft()
-        total += 1
-
+        
+    q = deque()
+    seen = {}
+    
+    # Add my start position (owner 0)
+    q.append((start_pos, 0))
+    seen[start_pos] = 0
+    
+    # Add enemy positions (owner 1)
+    for enemy in opponent_heads:
+        if is_safe(enemy, board, grid_dim):
+            q.append((enemy, 1))
+            seen[enemy] = 1
+            
+    my_territory = 0
+    total_processed = 0
+    
+    while q and total_processed < limit:
+        curr_pos, owner = q.popleft()
+        total_processed += 1
+        
+        # If this cell belongs to us, count it
+        if owner == 0:
+            my_territory += 1
+            
+        x, y = curr_pos
         for dx, dy in DIRECTIONS.values():
             nxt = (x + dx, y + dy)
-            if nxt not in seen and is_safe(nxt, board, grid_dim):
-                seen.add(nxt)
-                q.append(nxt)
-
-    return total
+            if is_safe(nxt, board, grid_dim) and nxt not in seen:
+                # Claim the square for whoever reached it first
+                seen[nxt] = owner
+                q.append((nxt, owner))
+                
+    return my_territory
 
 
 def distance_to_nearest_wall(pos, grid_dim):
