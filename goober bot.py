@@ -7,6 +7,7 @@ bot_state = {
     "target_id": None,
     "tick": 0
 }
+#fjseiuhjuseguehsiughiughsiueghuish
 
 def neighbors(pos):
     x, y = pos
