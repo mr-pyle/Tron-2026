@@ -1,6 +1,6 @@
 import collections
 
-team_name = "SmartHuggerv1"
+team_name = "SmartHuggerv2"
 
 def get_flood_fill_score(start_pos, board, grid_dim):
     """Counts how many empty tiles are reachable from a position."""
