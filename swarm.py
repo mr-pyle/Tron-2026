@@ -7,6 +7,7 @@ import os
 import math
 import concurrent.futures
 from tournament import headless_worker
+from bot_runner import is_bot_safe
 
 # --- NETWORK PROTOCOL ---
 def send_msg(sock, msg_dict):
@@ -161,6 +162,29 @@ class SwarmServer:
             self.update_ui("Error: No clients connected!")
             return
             
+        # --- FIXED: Filter out banned bots before distributing! ---
+        safe_bots = []
+        safe_snapshots = {}
+        for bot in selected_bots:
+            # Construct the exact file path
+            bot_filepath = os.path.join("bots", f"{bot}.py")
+            
+            # Unpack the Tuple!
+            is_safe, message = is_bot_safe(bot_filepath)
+            
+            if is_safe: 
+                safe_bots.append(bot)
+                if bot in code_snapshots:
+                    safe_snapshots[bot] = code_snapshots[bot]
+            else:
+                # Now we can actually show the kids WHY their bot was banned!
+                self.update_ui(f"Shield blocked {bot}: {message}")
+
+        if len(safe_bots) < 2:
+            self.update_ui("Error: Not enough safe bots to run a tournament!")
+            return
+        # ----------------------------------------------------------
+            
         with self.lock:
             self.target_runs = num_runs
             self.completed_runs = 0
@@ -170,12 +194,12 @@ class SwarmServer:
             for cid in self.clients:
                 self.clients[cid]["pending"] = 0
         
-        # 1. Distribute the bot code to everyone
+        # 1. Distribute the SAFE bot code to everyone
         init_payload = {
             "type": "init",
             "grid_dim": grid_dim,
-            "selected_bots": selected_bots,
-            "code_snapshots": code_snapshots
+            "selected_bots": safe_bots,        # <-- UPDATED
+            "code_snapshots": safe_snapshots   # <-- UPDATED
         }
         with self.lock:
             for client_info in self.clients.values():
