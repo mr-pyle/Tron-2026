@@ -14,6 +14,7 @@ import json
 from bot_runner import is_bot_safe, SecureBotProcess
 from tournament import headless_worker
 from engine import calculate_new_pos, resolve_collisions
+from swarm_ui import SwarmPanel
 
 BOTS_DIR = "bots"
 if not os.path.exists(BOTS_DIR):
@@ -113,6 +114,11 @@ class TronApp:
         self._dead_player_ids = set() 
         self.running = False
         self.is_paused = False
+        
+        # --- NEW SWARM STATE ---
+        self.server = None
+        self.client = None
+        # -----------------------
         
         self.setup_layout()
         self.refresh_bot_list()
@@ -225,9 +231,16 @@ class TronApp:
         self.bot_container.bind("<Enter>", _bind_mousewheel)
         self.bot_container.bind("<Leave>", _unbind_mousewheel)
 
-        # --- 4. MAIN GAME CANVAS (Add this back!) ---
+        # --- NEW: SWARM RIGHT SIDEBAR ---
+        self.right_sidebar = tk.Frame(self.root, width=280, bg=SIDEBAR_BG)
+        self.right_sidebar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.right_sidebar.pack_propagate(False)
+        self.swarm_panel = SwarmPanel(self.right_sidebar, self)
+
+        # --- 4. MAIN GAME CANVAS ---
         self.canvas_frame = tk.Frame(self.root, bg=DARK_BG)
-        self.canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        # Changed from side=tk.RIGHT to side=tk.LEFT so it gets sandwiched in the middle!
+        self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True) 
         
         self.canvas = tk.Canvas(
             self.canvas_frame, 
@@ -549,6 +562,33 @@ class TronApp:
             self.refresh_bot_sidebar()
 
     def start_tournament(self):
+        # --- SWARM INTERCEPT PROTOCOL ---
+        if self.swarm_panel.get_mode() == "Host Server":
+            if not self.swarm_panel.server or not self.swarm_panel.server.clients:
+                messagebox.showerror("Swarm Error", "Start the Host Server and wait for clients to connect first!")
+                return
+            
+            # FIXED: Changed self.bot_vars to self.available_bots to match your code!
+            selected = [b for b, var in self.available_bots.items() if var.get()]
+            if len(selected) < 2: 
+                messagebox.showwarning("Selection Error", "Please select at least 2 bots to battle!")
+                return
+            
+            code_snapshots = {}
+            for bot_name in selected:
+                bot_filepath = os.path.join("bots", f"{bot_name}.py")
+                with open(bot_filepath, 'r', encoding='utf-8') as f:
+                    code_snapshots[bot_name] = f.read()
+                    
+            # Fire off the tournament via the network instead of local!
+            self.swarm_panel.server.start_tournament(
+                self.grid_dim, 
+                selected, 
+                code_snapshots, 
+                int(self.rounds_var.get())
+            )
+            return  # Stop the function so it doesn't run locally!
+        
         selected = [bot for bot, var in self.available_bots.items() if var.get()]
         if len(selected) < 2: return messagebox.showwarning("Error", "Select at least 2 bots!")
 
