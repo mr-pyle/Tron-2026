@@ -155,14 +155,18 @@ class SecureBotProcess:
                 print(f"[SECURITY] Tampering detected in {filepath}! Healing file.")
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(pristine_code)
-                    
+
+        my_env = os.environ.copy()
+        my_env["TRON_BOT_NAME"] = self.name  # Securely pass the true name
+
         self.process = subprocess.Popen(
             [sys.executable, "-c", RUNNER_CODE, bot_filename],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1 
+            bufsize=1,
+            env=my_env
         )
 
     def get_move(self, pos, board, dim, safe_players, timeout=2.0):
