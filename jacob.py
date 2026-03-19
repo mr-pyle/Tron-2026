@@ -1,118 +1,120 @@
 def move(pos, board, dim, safe_players):
-    x, y = pos
+    # --- 1. THE BARE METAL INDEXER ---
+    # We completely abandon X,Y coordinates. Everything is a single integer index.
+    my_idx = pos[1] * dim + pos[0]
+    
+    flat_board = [False] * (dim * dim)
+    for bx, by in board:
+        flat_board[by * dim + bx] = True
 
-    # 1. THE TIME-WARP ENGINE (Massive Speed Optimization)
-    # The tournament likely passes the board as a standard List. Searching a list takes O(N) time.
-    # By converting it to a Python Set right here, we drop lookup times to O(1). 
-    # This makes the bot roughly 100x faster, unlocking the ability to see into the future.
-    fast_board = set(board)
-
-    # 2. Extract Enemy Heads
-    enemy_heads = []
+    enemy_indices = []
     for p in safe_players:
         if p.get("alive") and p.get("pos") != pos:
-            # We enforce tuples so they can be hashed easily
-            enemy_heads.append(tuple(p.get("pos"))) 
+            ex, ey = p.get("pos")
+            enemy_indices.append(ey * dim + ex)
 
-    # 3. Phase Shifting
-    match_progress = len(fast_board) / (dim * dim)
+    match_progress = len(board) / (dim * dim)
     is_hunting_phase = match_progress < 0.40
 
-    # Valid Immediate Moves
-    possible_moves = [
-        (x, y - 1, "UP"), (x, y + 1, "DOWN"), 
-        (x - 1, y, "LEFT"), (x + 1, y, "RIGHT")
-    ]
+    # 1D Directional Offsets: UP, DOWN, LEFT, RIGHT
+    offsets = [(-dim, "UP"), (dim, "DOWN"), (-1, "LEFT"), (1, "RIGHT")]
     
     valid_moves = []
-    for nx, ny, direction in possible_moves:
-        if 0 <= nx < dim and 0 <= ny < dim and (nx, ny) not in fast_board:
-            valid_moves.append((nx, ny, direction))
+    for offset, direction in offsets:
+        n_idx = my_idx + offset
+        # Boundary math using modulo to ensure we didn't wrap around the edges
+        if 0 <= n_idx < (dim * dim) and not flat_board[n_idx]:
+            # Extra check to prevent LEFT/RIGHT from wrapping around the map horizontally
+            if offset == 1 and n_idx % dim == 0: continue
+            if offset == -1 and my_idx % dim == 0: continue
+            valid_moves.append((n_idx, direction, offset))
 
     if not valid_moves:
-        return "UP" # Trapped, accept fate
+        return "UP"
 
-    best_move = valid_moves[0][2]
-    best_score = -float('inf')
+    best_move = valid_moves[0][1]
+    best_score = -9999999
 
-    for nx, ny, direction in valid_moves:
-        # --- FUTURE-CASTING (Depth-2 Lookahead) ---
-        # We temporarily claim this square as our own to see what happens NEXT.
-        fast_board.add((nx, ny))
-        
-        future_moves = [
-            (nx, ny - 1), (nx, ny + 1), 
-            (nx - 1, ny), (nx + 1, ny)
-        ]
+    for n_idx, direction, move_offset in valid_moves:
+        flat_board[n_idx] = True
         
         valid_futures = 0
-        max_future_score = -float('inf')
+        max_future_score = -9999999
         
-        for nnx, nny in future_moves:
-            if 0 <= nnx < dim and 0 <= nny < dim and (nnx, nny) not in fast_board:
+        for f_offset, _ in offsets:
+            nn_idx = n_idx + f_offset
+            if 0 <= nn_idx < (dim * dim) and not flat_board[nn_idx]:
+                if f_offset == 1 and nn_idx % dim == 0: continue
+                if f_offset == -1 and n_idx % dim == 0: continue
+                
                 valid_futures += 1
                 
-                # Run the Neural Graph on our FUTURE position
-                # Limit slightly reduced to 400 to guarantee we stay under the 0.1s timeout
-                stats = analyze_map((nnx, nny), enemy_heads, fast_board, dim, limit=400)
+                # --- PROJECTED ENEMIES (Pure Integer Math) ---
+                projected_enemies = []
+                for e_idx in enemy_indices:
+                    moved = False
+                    for e_off, _ in offsets:
+                        pe_idx = e_idx + e_off
+                        if 0 <= pe_idx < (dim * dim) and not flat_board[pe_idx]:
+                            if e_off == 1 and pe_idx % dim == 0: continue
+                            if e_off == -1 and e_idx % dim == 0: continue
+                            projected_enemies.append(pe_idx)
+                            moved = True
+                    if not moved:
+                        projected_enemies.append(e_idx)
                 
-                # THE GOD FORMULA
+                # Run the hyper-optimized 1D Neural Graph
+                stats = analyze_map(nn_idx, projected_enemies, flat_board, dim, offsets, limit=350)
+                
                 score = (stats["my_area"] * 100) - (stats["opp_area"] * 150)
                 
-                # --- ISOLATION ENDGAME CHECK ---
-                # If opp_area is 0, we have completely sealed off our own private room.
                 if stats["opp_area"] == 0 and stats["neutral"] == 0:
-                    # The war is over. Pivot entirely to Perfect Space-Packing.
-                    # We multiply by 10,000 so it ignores all other logic and focuses purely on survival.
                     score = stats["my_area"] * 10000 
                 else:
-                    # Immediate Danger & Aggression Checks
+                    # Manhattan distance without X/Y tuples (using integer division and modulo)
                     min_enemy_dist = 999
-                    for ex, ey in enemy_heads:
-                        dist = abs(nnx - ex) + abs(nny - ey)
+                    my_nx, my_ny = nn_idx % dim, nn_idx // dim
+                    for ex, ey in [ (e % dim, e // dim) for e in enemy_indices ]:
+                        dist = abs(my_nx - ex) + abs(my_ny - ey)
                         if dist < min_enemy_dist:
                             min_enemy_dist = dist
                             
-                    if min_enemy_dist <= 1:
-                        score -= 100000 
-                    elif min_enemy_dist == 2:
-                        score -= 5000   
+                    if min_enemy_dist <= 1: score -= 100000 
+                    elif min_enemy_dist == 2: score -= 5000   
                         
-                    if is_hunting_phase and min_enemy_dist > 2:
-                        score -= (min_enemy_dist * 20) 
-                    elif not is_hunting_phase:
-                        score += (min_enemy_dist * 10)
+                    if is_hunting_phase and min_enemy_dist > 2: score -= (min_enemy_dist * 20) 
+                    elif not is_hunting_phase: score += (min_enemy_dist * 10)
                         
-                    # Choke Point Bias
-                    if stats["opp_area"] < 10 and stats["my_area"] > 20:
-                        score += 50000 
+                    if stats["opp_area"] < 10 and stats["my_area"] > 20: score += 50000 
 
-                # Future Wall Hugging
-                neighbors = [(nnx, nny-1), (nnx, nny+1), (nnx-1, nny), (nnx+1, nny)]
-                walls = sum(1 for vx, vy in neighbors if vx < 0 or vx >= dim or vy < 0 or vy >= dim or (vx, vy) in fast_board)
+                # Wall count via integer offsets
+                walls = 0
+                for w_off, _ in offsets:
+                    w_idx = nn_idx + w_off
+                    if w_idx < 0 or w_idx >= (dim * dim) or flat_board[w_idx]:
+                        walls += 1
+                    elif w_off == 1 and w_idx % dim == 0: walls += 1
+                    elif w_off == -1 and nn_idx % dim == 0: walls += 1
+                        
                 wall_weight = 30 if is_hunting_phase else 120 
                 score += walls * wall_weight 
-
-                # Tie-breaker: Depth
                 score += stats["max_depth"]
 
-                if score > max_future_score:
-                    max_future_score = score
+                if score > max_future_score: max_future_score = score
                     
-        # Clean up our simulation so it doesn't mess up the next loop iteration
-        fast_board.remove((nx, ny)) 
+        flat_board[n_idx] = False 
         
-        # If moving here leaves us trapped with 0 moves on the NEXT turn, it's a death trap!
-        if valid_futures == 0:
-            current_move_score = -1000000 
-        else:
-            # We judge this immediate move by its BEST possible future
-            current_move_score = max_future_score
-            
-        # Tie-breaker logic for the immediate step
-        immediate_neighbors = [(nx, ny-1), (nx, ny+1), (nx-1, ny), (nx+1, ny)]
-        imm_walls = sum(1 for vx, vy in immediate_neighbors if vx < 0 or vx >= dim or vy < 0 or vy >= dim or (vx, vy) in fast_board)
-        current_move_score += imm_walls * 5 # Slight bump so we don't float aimlessly if futures tie
+        current_move_score = max_future_score if valid_futures > 0 else -1000000
+        
+        # Tie-breaker immediate walls
+        imm_walls = 0
+        for w_off, _ in offsets:
+            w_idx = my_idx + w_off
+            if w_idx < 0 or w_idx >= (dim * dim) or flat_board[w_idx]: imm_walls += 1
+            elif w_off == 1 and w_idx % dim == 0: imm_walls += 1
+            elif w_off == -1 and my_idx % dim == 0: imm_walls += 1
+                
+        current_move_score += imm_walls * 5 
             
         if current_move_score > best_score:
             best_score = current_move_score
@@ -121,48 +123,99 @@ def move(pos, board, dim, safe_players):
     return best_move
 
 
-def analyze_map(start_p, opp_ps, fast_board, dim, limit=400):
+def analyze_map(start_idx, opp_indices, flat_board, dim, offsets, limit=350):
     """
-    The Neural Graph - Now optimized to use the O(1) fast_board.
+    The Bare Metal Graph.
+    No tuples. No standard loops. Local variable caching.
     """
-    queue = [(start_p, 0, True)]
-    for op in opp_ps:
-        queue.append((op, 0, False))
+    # Initialize with [index, distance, is_me]
+    # We use a flat list and groups of 3 to avoid tuple creation entirely
+    queue = [start_idx, 0, True]
+    for op_idx in opp_indices:
+        queue.extend([op_idx, 0, False])
         
-    visited = {start_p: (0, True)}
-    for op in opp_ps:
-        visited[op] = (0, False)
+    visited = {start_idx: (0, True)}
+    for op_idx in opp_indices:
+        visited[op_idx] = (0, False)
         
-    stats = {"my_area": 0, "opp_area": 0, "neutral": 0, "max_depth": 0}
+    my_area = 0
+    opp_area = 0
+    neutral = 0
+    max_depth = 0
+    
+    # --- LOCAL CACHING ---
+    # Assigning methods to local variables skips Python's global dictionary lookup.
+    # This makes the inner loop run significantly faster.
+    q_extend = queue.extend
     
     read_idx = 0
-    while read_idx < len(queue) and read_idx < limit:
-        curr, dist, is_me = queue[read_idx]
-        read_idx += 1 
+    q_len = len(queue)
+    total_cells = dim * dim
+    
+    # Unroll the offsets for extreme speed
+    off_up, off_down, off_left, off_right = -dim, dim, -1, 1
+    
+    while read_idx < q_len and read_idx < limit * 3:
+        c_idx = queue[read_idx]
+        dist = queue[read_idx + 1]
+        is_me = queue[read_idx + 2]
+        read_idx += 3 
         
-        if is_me and dist > stats["max_depth"]:
-            stats["max_depth"] = dist
+        if is_me and dist > max_depth:
+            max_depth = dist
 
-        cx, cy = curr
-        for dx, dy in ((0,1), (0,-1), (1,0), (-1,0)):
-            nx, ny = cx + dx, cy + dy
-            
-            # Now using fast_board (O(1)) instead of board (O(N))
-            if 0 <= nx < dim and 0 <= ny < dim and (nx, ny) not in fast_board:
-                if (nx, ny) not in visited:
-                    visited[(nx, ny)] = (dist + 1, is_me)
-                    
-                    if is_me: 
-                        stats["my_area"] += 1
-                    else: 
-                        stats["opp_area"] += 1
-                        
-                    queue.append(((nx, ny), dist + 1, is_me))
-                else:
-                    v_dist, v_me = visited[(nx, ny)]
-                    if v_dist == dist + 1 and v_me != is_me:
-                        stats["neutral"] += 1
-                        
-    return stats
+        new_dist = dist + 1
+        
+        # --- LOOP UNROLLING ---
+        # Instead of `for offset in offsets`, we explicitly write out the 4 checks.
+        # This completely bypasses the overhead of creating Python iterator objects.
+        
+        # UP
+        n_idx = c_idx + off_up
+        if n_idx >= 0 and not flat_board[n_idx]:
+            if n_idx not in visited:
+                visited[n_idx] = (new_dist, is_me)
+                if is_me: my_area += 1
+                else: opp_area += 1
+                q_extend([n_idx, new_dist, is_me])
+                q_len += 3
+            elif visited[n_idx][0] == new_dist and visited[n_idx][1] != is_me:
+                neutral += 1
 
-#help
+        # DOWN
+        n_idx = c_idx + off_down
+        if n_idx < total_cells and not flat_board[n_idx]:
+            if n_idx not in visited:
+                visited[n_idx] = (new_dist, is_me)
+                if is_me: my_area += 1
+                else: opp_area += 1
+                q_extend([n_idx, new_dist, is_me])
+                q_len += 3
+            elif visited[n_idx][0] == new_dist and visited[n_idx][1] != is_me:
+                neutral += 1
+
+        # LEFT
+        n_idx = c_idx + off_left
+        if n_idx >= 0 and c_idx % dim != 0 and not flat_board[n_idx]:
+            if n_idx not in visited:
+                visited[n_idx] = (new_dist, is_me)
+                if is_me: my_area += 1
+                else: opp_area += 1
+                q_extend([n_idx, new_dist, is_me])
+                q_len += 3
+            elif visited[n_idx][0] == new_dist and visited[n_idx][1] != is_me:
+                neutral += 1
+
+        # RIGHT
+        n_idx = c_idx + off_right
+        if n_idx < total_cells and n_idx % dim != 0 and not flat_board[n_idx]:
+            if n_idx not in visited:
+                visited[n_idx] = (new_dist, is_me)
+                if is_me: my_area += 1
+                else: opp_area += 1
+                q_extend([n_idx, new_dist, is_me])
+                q_len += 3
+            elif visited[n_idx][0] == new_dist and visited[n_idx][1] != is_me:
+                neutral += 1
+                        
+    return {"my_area": my_area, "opp_area": opp_area, "neutral": neutral, "max_depth": max_depth}
