@@ -1,4 +1,6 @@
-# helloworld.py – Hamilton-style corridor maximizer (strong counter to Penguin 0)
+# helloworld.py
+# WallEater – designed to counter APEX v5 by wall-hugging + tight corridor filling
+# Exploits APEX's articulation-guard conservatism and prediction failures
 
 import random
 from collections import deque
@@ -8,34 +10,35 @@ team_name = "HelloWorld"
 prev_pos = None
 current_dir = "RIGHT"
 
-DIRECTIONS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
-OPPOSITE = {"UP":"DOWN", "DOWN":"UP", "LEFT":"RIGHT", "RIGHT":"LEFT"}
-
-RIGHT_HAND_RULE = {
-    "UP":    ["RIGHT", "UP", "LEFT", "DOWN"],
-    "RIGHT": ["DOWN", "RIGHT", "UP", "LEFT"],
-    "DOWN":  ["LEFT", "DOWN", "RIGHT", "UP"],
-    "LEFT":  ["UP", "LEFT", "DOWN", "RIGHT"]
+DIRECTIONS = {
+    "UP":    (0, -1),
+    "DOWN":  (0, 1),
+    "LEFT":  (-1, 0),
+    "RIGHT": (1, 0)
 }
 
-# ── prefer this order when space is large ──
-LONG_CORRIDOR_RULE = {
-    "UP":    ["UP", "RIGHT", "LEFT", "DOWN"],     # straight first
-    "RIGHT": ["RIGHT", "DOWN", "UP", "LEFT"],
-    "DOWN":  ["DOWN", "LEFT", "RIGHT", "UP"],
-    "LEFT":  ["LEFT", "UP", "DOWN", "RIGHT"]
+OPPOSITE = {"UP":"DOWN", "DOWN":"UP", "LEFT":"RIGHT", "RIGHT":"LEFT"}
+
+# Prefer staying close to walls when possible
+WALL_HUG_RULE = {
+    "UP":    ["LEFT", "RIGHT", "UP", "DOWN"],     # prefer left/right along wall
+    "RIGHT": ["UP", "DOWN", "RIGHT", "LEFT"],
+    "DOWN":  ["RIGHT", "LEFT", "DOWN", "UP"],
+    "LEFT":  ["DOWN", "UP", "LEFT", "RIGHT"]
 }
 
 def infer_direction(old, new):
-    dx, dy = new[0] - old[0], new[1] - old[1]
+    dx = new[0] - old[0]
+    dy = new[1] - old[1]
     for d, (ddx, ddy) in DIRECTIONS.items():
-        if (dx, dy) == (ddx, ddy): return d
+        if (dx, dy) == (ddx, ddy):
+            return d
     return current_dir
 
 def is_safe(nx, ny, grid_dim, board):
     return 0 <= nx < grid_dim and 0 <= ny < grid_dim and (nx, ny) not in board
 
-def fast_flood(start, board, grid_dim, max_check=550):
+def fast_flood(start, board, grid_dim, max_check=500):
     visited = set([start])
     q = deque([start])
     count = 1
@@ -48,8 +51,12 @@ def fast_flood(start, board, grid_dim, max_check=550):
                 q.append((nx, ny))
                 count += 1
                 if count >= max_check:
-                    return max_check + 3000
+                    return max_check + 2500
     return count
+
+def distance_to_wall(pos, grid_dim):
+    x, y = pos
+    return min(x, y, grid_dim-1-x, grid_dim-1-y)
 
 def move(my_pos, board, grid_dim, players):
     global prev_pos, current_dir
@@ -58,11 +65,8 @@ def move(my_pos, board, grid_dim, players):
         current_dir = infer_direction(prev_pos, my_pos)
     prev_pos = my_pos
 
-    # Choose rule based on board openness
-    rule = LONG_CORRIDOR_RULE if len(board) < grid_dim*grid_dim//3 else RIGHT_HAND_RULE
     candidates = []
-
-    for d in rule[current_dir]:
+    for d in WALL_HUG_RULE[current_dir]:
         dx, dy = DIRECTIONS[d]
         nx, ny = my_pos[0] + dx, my_pos[1] + dy
         if is_safe(nx, ny, grid_dim, board):
@@ -88,25 +92,28 @@ def move(my_pos, board, grid_dim, players):
 
         score = space * 10000
 
-        # Very strong corridor bias
+        # Very strong wall-hugging bias – stay near borders
+        wall_dist = distance_to_wall(next_pos, grid_dim)
+        score += (5 - wall_dist) * 800   # reward being close to any wall
+
+        # Momentum – but secondary to wall-hugging
         if d == current_dir:
-            score += 600
-        elif d == rule[current_dir][0]:
-            score += 400
+            score += 350
+        elif d == WALL_HUG_RULE[current_dir][0]:
+            score += 220
 
-        # Avoid 180° very strongly
-        if d == OPPOSITE.get(current_dir, None):
-            score -= 2500
-
-        # Avoid closing into dead-ends early
+        # Avoid articulation-like moves (mimic APEX weakness)
         free_n = sum(1 for dx, dy in DIRECTIONS.values()
-                     if is_safe(next_pos[0] + dx, next_pos[1] + dy,
-                                grid_dim, temp_board))
-        if space > 800 and free_n <= 2:
-            score -= 1800
+                     if is_safe(next_pos[0] + dx, next_pos[1] + dy, grid_dim, temp_board))
+        if space > 700 and free_n <= 2:
+            score -= 4000           # heavy penalty – exploits APEX's own articulation guard
+
+        # Avoid reverse
+        if d == OPPOSITE.get(current_dir, None):
+            score -= 3000
 
         if score > best_score:
             best_score = score
             best_dir = d
 
-    return best_dir if best_dir else random.choice([d for d,_ in candidates])
+    return best_dir if best_dir else random.choice([d for d, _ in candidates])
