@@ -239,17 +239,39 @@ class TronApp:
 
         # --- 4. MAIN GAME CANVAS ---
         self.canvas_frame = tk.Frame(self.root, bg=DARK_BG)
-        # Changed from side=tk.RIGHT to side=tk.LEFT so it gets sandwiched in the middle!
+        # Packed to the LEFT so it gets sandwiched between your two sidebars!
         self.canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True) 
         
+        # 1. Create the Scrollbar FIRST
+        self.main_scrollbar = tk.Scrollbar(self.canvas_frame, orient="vertical")
+        
+        # 2. Create the Canvas and link it to the scrollbar
         self.canvas = tk.Canvas(
             self.canvas_frame, 
-            width=self.grid_dim * self.cell_size, 
-            height=self.grid_dim * self.cell_size, 
             bg="black", 
-            highlightthickness=0
+            highlightthickness=0,
+            yscrollcommand=self.main_scrollbar.set
         )
-        self.canvas.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self.main_scrollbar.config(command=self.canvas.yview)
+        
+        # 3. Pack them side-by-side
+        self.main_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # 4. Bind mouse wheel scrolling specifically for the main canvas
+        def _on_main_mousewheel(event):
+            # ONLY scroll if the scrollbar is actively visible on the screen!
+            if self.main_scrollbar.winfo_ismapped():
+                self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        def _bind_main_mousewheel(event):
+            self.canvas.bind_all("<MouseWheel>", _on_main_mousewheel)
+
+        def _unbind_main_mousewheel(event):
+            self.canvas.unbind_all("<MouseWheel>")
+
+        self.canvas.bind("<Enter>", _bind_main_mousewheel)
+        self.canvas.bind("<Leave>", _unbind_main_mousewheel)
 
     def refresh_bot_list(self):
         for widget in self.bot_scroll_frame.winfo_children(): widget.destroy()
@@ -402,6 +424,10 @@ class TronApp:
             self._engine_board[pos] = i + 1
 
     def start_visual_match(self):
+        self.main_scrollbar.pack_forget()
+        self.canvas.yview_moveto(0)
+        self.canvas.configure(scrollregion=())
+
         # --- AUTO-SCALE THE BOARD ---
         # 1. Measure the current size of the dark gray frame on the right
         frame_width = self.canvas_frame.winfo_width()
@@ -662,7 +688,11 @@ class TronApp:
         threading.Thread(target=pool_manager, daemon=True).start()
 
     def draw_tournament_progress(self, _engine_secure_stats_v9, current_round, total_rounds):
+        self.main_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True) # Repack canvas to prevent overlapping
         self.canvas.delete("all")
+        self.canvas.yview_moveto(0)
+
         w = self.canvas.winfo_width()
         
         self.canvas.create_text(w//2, 40, text=f"TOURNAMENT PROGRESS: ROUND {current_round} OF {total_rounds}", fill="white", font=("Courier", 20, "bold"))
@@ -695,6 +725,7 @@ class TronApp:
             self.canvas.create_rectangle(420, y_offset-12, 420+bar_width, y_offset+12, fill=s['color'], outline="")
             self.canvas.create_text(420+bar_width+10, y_offset, text=f"{s['avg_surv']:.1f} ticks", fill="white", font=("Courier", 10), anchor=tk.W)
             y_offset += 40
+        self.canvas.configure(scrollregion=(0, 0, w, y_offset + 50))
 
     def finalize_tournament(self, _engine_secure_stats_v9, rounds):
         self.btn_tourney.config(state=tk.NORMAL) 
