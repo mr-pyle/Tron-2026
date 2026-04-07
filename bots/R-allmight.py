@@ -1,81 +1,108 @@
-import collections
-
 class SingularityBot:
     def __init__(self):
-        self.memo = {}
+        self.DEPTH = 3 
+        self.directions = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+
+    def get_valid_moves(self, pos, board, dim):
+        moves = []
+        for d in ["UP", "DOWN", "LEFT", "RIGHT"]:
+            dx, dy = self.directions[d]
+            nx, ny = pos[0] + dx, pos[1] + dy
+            if 0 <= nx < dim and 0 <= ny < dim and (nx, ny) not in board:
+                moves.append((d, (nx, ny)))
+        return moves
+
+    def voronoi_score(self, my_pos, opp_pos, board, dim):
+        """Standard BFS using a list-queue to avoid 'collections' import."""
+        q = [(my_pos, 0, True), (opp_pos, 0, False)]
+        visited = {my_pos: True, opp_pos: False}
+        score = 0
+        idx = 0
+        
+        # Limit search to 300 nodes to guarantee speed
+        while idx < len(q) and idx < 300:
+            curr, dist, is_me = q[idx]
+            idx += 1
+            for d in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = curr[0] + d[0], curr[1] + d[1]
+                target = (nx, ny)
+                if 0 <= nx < dim and 0 <= ny < dim and target not in board and target not in visited:
+                    visited[target] = is_me
+                    if is_me:
+                        score += 1
+                    q.append((target, dist + 1, is_me))
+        return score
+
+    def minimax(self, my_pos, opp_pos, board, depth, alpha, beta, is_maximizing, dim):
+        my_moves = self.get_valid_moves(my_pos, board, dim)
+        opp_moves = self.get_valid_moves(opp_pos, board, dim)
+        
+        if not my_moves: return -100000 + (self.DEPTH - depth)
+        if not opp_moves: return 100000 - (self.DEPTH - depth)
+        if depth == 0: return self.voronoi_score(my_pos, opp_pos, board, dim)
+
+        if is_maximizing:
+            max_eval = -2000000
+            for _, next_pos in my_moves:
+                board[next_pos] = 1
+                ev = self.minimax(next_pos, opp_pos, board, depth - 1, alpha, beta, False, dim)
+                del board[next_pos]
+                if ev > max_eval: max_eval = ev
+                if ev > alpha: alpha = ev
+                if beta <= alpha: break
+            return max_eval
+        else:
+            min_eval = 2000000
+            for _, next_pos in opp_moves:
+                board[next_pos] = 1
+                ev = self.minimax(my_pos, next_pos, board, depth - 1, alpha, beta, True, dim)
+                del board[next_pos]
+                if ev < min_eval: min_eval = ev
+                if ev < beta: beta = ev
+                if beta <= alpha: break
+            return min_eval
 
     def move(self, my_pos, board, dim, players):
-        # 1. THE NEURAL GRAPH (BFS + Parity)
-        def analyze_map(start_p, opp_ps, current_board):
-            # Influence map with distance tracking
-            q = collections.deque([(start_p, 0, True)])
-            for op in opp_ps:
-                q.append((op, 0, False))
-            
-            visited = {start_p: (0, True)}
-            for op in opp_ps:
-                visited[op] = (0, False)
-                
-            stats = {"my_area": 0, "opp_area": 0, "neutral": 0}
-            
-            while q:
-                curr, dist, is_me = q.popleft()
-                for dx, dy in ((0,1),(0,-1),(1,0),(-1,0)):
-                    nx, ny = curr[0]+dx, curr[1]+dy
-                    if 0 <= nx < dim and 0 <= ny < dim and (nx, ny) not in current_board:
-                        if (nx, ny) not in visited:
-                            visited[(nx, ny)] = (dist + 1, is_me)
-                            if is_me: stats["my_area"] += 1
-                            else: stats["opp_area"] += 1
-                            q.append(((nx, ny), dist + 1, is_me))
-                        else:
-                            # Conflict square: if we reach it at the same time, it's neutral
-                            v_dist, v_me = visited[(nx, ny)]
-                            if v_dist == dist + 1 and v_me != is_me:
-                                stats["neutral"] += 1
-            return stats
-
-        # 2. THE HUNTING PROTOCOL
-        opps = [p['pos'] for p in players if p['alive'] and p['pos'] != my_pos]
-        if not opps: return "UP"
+        my_pos = (my_pos[0], my_pos[1])
+        
+        # Filter opponents
+        active_opps = []
+        for p in players:
+            if p['alive'] and (p['pos'][0], p['pos'][1]) != my_pos:
+                active_opps.append(p)
+        
+        if not active_opps:
+            valid = self.get_valid_moves(my_pos, board, dim)
+            return valid[0][0] if valid else "UP"
+        
+        # Target the closest opponent
+        target_opp = (active_opps[0]['pos'][0], active_opps[0]['pos'][1])
+        min_dist = 9999
+        for p in active_opps:
+            d = abs(my_pos[0]-p['pos'][0]) + abs(my_pos[1]-p['pos'][1])
+            if d < min_dist:
+                min_dist = d
+                target_opp = (p['pos'][0], p['pos'][1])
 
         best_move = "UP"
-        ultimate_score = -float('inf')
+        best_score = -2000000
+        
+        valid_choices = self.get_valid_moves(my_pos, board, dim)
+        if not valid_choices: return "UP"
 
-        # Directional Priority
-        for d, (dx, dy) in {"UP":(0,-1), "DOWN":(0,1), "LEFT":(-1,0), "RIGHT":(1,0)}.items():
-            nx, ny = my_pos[0]+dx, my_pos[1]+dy
+        for d, next_pos in valid_choices:
+            board[next_pos] = 1
+            score = self.minimax(next_pos, target_opp, board, self.DEPTH, -2000000, 2000000, False, dim)
+            del board[next_pos]
             
-            if not (0 <= nx < dim and 0 <= ny < dim) or (nx, ny) in board:
-                continue
-
-            # Calculate the 'Map Fate'
-            res = analyze_map((nx, ny), opps, board)
-            
-            # --- THE GOD FORMULA ---
-            # 1. My Area: Total potential squares I own.
-            # 2. Opp Area: Total potential squares they own.
-            # 3. Aggression: Distance to nearest enemy (to keep them cornered).
-            dist_to_enemy = min(abs(nx - op[0]) + abs(ny - op[1]) for op in opps)
-            
-            # We weigh 'My Area' as infinite survival, 
-            # but we weigh 'Opp Area' as a negative multiplier.
-            # If Opp Area is 0, we have won the partition.
-            score = (res["my_area"] * 100) - (res["opp_area"] * 150) - dist_to_enemy
-
-            # 4. CHOKE POINT BIAS
-            # If this move reduces the opponent's area to a fraction of ours, 
-            # it's a 'Kill Move'.
-            if res["opp_area"] < 10 and res["my_area"] > 20:
-                score += 10000 
-
-            if score > ultimate_score:
-                ultimate_score = score
+            if score > best_score:
+                best_score = score
                 best_move = d
-
+                
         return best_move
 
-# Global instantiation
-singularity = SingularityBot()
+# Instance creation for the runner
+bot_instance = SingularityBot()
+
 def move(my_pos, board, dim, players):
-    return singularity.move(my_pos, board, dim, players)
+    return bot_instance.move(my_pos, board, dim, players)

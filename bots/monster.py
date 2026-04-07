@@ -1,62 +1,84 @@
 import random
 
-team_name = "Overlord_v4"
+team_name = "monster"
 
 def move(my_pos, board, grid_dim, players):
     x, y = my_pos
     directions = {"UP": (x, y - 1), "DOWN": (x, y + 1), "LEFT": (x - 1, y), "RIGHT": (x + 1, y)}
     enemies = [p['pos'] for p in players if p['alive'] and p['pos'] != my_pos]
 
-    def get_advanced_score(start_pos, current_board, enemy_positions):
+    def get_valid_neighbors(pos, current_board):
+        """Returns adjacent tiles that are inside the grid and not blocked."""
+        valid = []
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = pos[0] + dx, pos[1] + dy
+            if 0 <= nx < grid_dim and 0 <= ny < grid_dim and (nx, ny) not in current_board:
+                valid.append((nx, ny))
+        return valid
+
+    def get_chamber_size(start_pos, current_board, limit=500):
         """
-        Combines Voronoi territory with a 'bottleneck' check.
-        It penalizes moves that lead into areas with narrow exits.
+        Calculates the ABSOLUTE size of the closed-off area this move leads to.
+        This prevents the bot from ever walking into a small, dead-end trap.
         """
-        mine = {start_pos}
-        # Multi-agent BFS to find contested territory
+        queue = [start_pos]
+        visited = {start_pos}
+        while queue and len(visited) < limit:
+            curr = queue.pop(0)
+            for n in get_valid_neighbors(curr, current_board):
+                if n not in visited:
+                    visited.add(n)
+                    queue.append(n)
+        return len(visited)
+
+    def get_voronoi_territory(start_pos, current_board):
+        """
+        Calculates how much of the open space we can reach BEFORE the enemy.
+        """
         queue = [(start_pos, 0, True)]
-        for e_pos in enemy_positions:
-            queue.append((e_pos, 0, False))
+        for e in enemies:
+            queue.append((e, 0, False))
         
-        visited = {start_pos} | set(enemy_positions)
-        my_territory = []
+        visited = {start_pos} | set(enemies)
+        my_tiles = 0
         
         while queue:
-            (curr_x, curr_y), dist, is_me = queue.pop(0)
-            if dist > 25: continue # Increased depth for long-range planning
-
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = curr_x + dx, curr_y + dy
-                if (0 <= nx < grid_dim and 0 <= ny < grid_dim and 
-                    (nx, ny) not in current_board and (nx, ny) not in visited):
-                    visited.add((nx, ny))
-                    queue.append(((nx, ny), dist + 1, is_me))
-                    if is_me: my_territory.append((nx, ny))
-
-        if not my_territory: return 0
-
-        # BOTTLENECK CHECK: How many 'exit' options do we have in our territory?
-        exit_count = 0
-        for tx, ty in my_territory[:10]: # Check immediate future tiles
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                if (tx+dx, ty+dy) not in current_board and (tx+dx, ty+dy) not in my_territory:
-                    exit_count += 1
-        
-        return len(my_territory) + (exit_count * 2)
+            curr, dist, is_me = queue.pop(0)
+            if dist > 30: continue # Cap the search depth for performance
+            
+            for n in get_valid_neighbors(curr, current_board):
+                if n not in visited:
+                    visited.add(n)
+                    queue.append((n, dist + 1, is_me))
+                    if is_me:
+                        my_tiles += 1
+        return my_tiles
 
     scored_moves = []
-    for move_dir, (nx, ny) in directions.items():
-        if 0 <= nx < grid_dim and 0 <= ny < grid_dim and (nx, ny) not in board:
-            score = get_advanced_score((nx, ny), board, enemies)
+    for move_dir, n_pos in directions.items():
+        if 0 <= n_pos[0] < grid_dim and 0 <= n_pos[1] < grid_dim and n_pos not in board:
             
-            # Wall-hug only when space is abundant (early game)
-            # If space is tight, ignore walls and fight for territory
-            wall_dist = min(nx, ny, grid_dim - nx, grid_dim - ny)
-            wall_bonus = 2.0 / (wall_dist + 1) if score > 50 else 0
+            # 1. Survival: How big is the box we are entering?
+            chamber_size = get_chamber_size(n_pos, board)
             
-            scored_moves.append({'dir': move_dir, 'score': score + wall_bonus})
+            # 2. Dominance: How much of that box belongs to us?
+            territory = get_voronoi_territory(n_pos, board)
+            
+            # 3. Compactness: How many walls/trails are we touching? 
+            # (Higher is better for late-game space-filling)
+            adjacent_obstacles = 4 - len(get_valid_neighbors(n_pos, board))
+            
+            # SCORING HIERARCHY:
+            # Chamber size is weighted massively (1000x) so we never choose a smaller trap.
+            # Territory decides ties between equally large chambers.
+            # Obstacles force the bot to hug walls and coil tightly.
+            score = (chamber_size * 1000) + (territory * 10) + adjacent_obstacles
+            
+            scored_moves.append({'dir': move_dir, 'score': score})
 
-    if not scored_moves: return "UP"
+    if not scored_moves:
+        return "UP"
 
+    # Execute the mathematically optimal move
     scored_moves.sort(key=lambda m: m['score'], reverse=True)
     return scored_moves[0]['dir']

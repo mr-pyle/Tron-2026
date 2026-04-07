@@ -1,146 +1,138 @@
-import collections
-import json
-import os
-import random
-import threading
+from collections import deque
 
-team_name = "TengenToppa"
+team_name = "TENGEN_TOPPA"
 
-DNA_FILE = "spiral_dna.json"
-# Use a thread lock to prevent the Tkinter engine crash!
-file_lock = threading.Lock() 
-
-DEFAULT_DNA = {
-    "hunted_area": 50.0,
-    "hunted_compact": 500.0,
-    "safe_area": 100.0,
-    "safe_edges": 1.0,
-    "safe_mid_penalty": 5.0
+# Persistent memory for a single match
+MEMORY = {
+    "turn": 0,
+    "profiles": {},  # Tracks enemy aggression
+    "initialized": False
 }
 
-MEMORY = {"turn": 0, "dna": DEFAULT_DNA.copy()}
-
-def load_and_evolve():
-    """Thread-safe hyper-evolution."""
-    with file_lock:
-        try:
-            if not os.path.exists(DNA_FILE):
-                return DEFAULT_DNA.copy()
-                
-            with open(DNA_FILE, "r") as f:
-                data = json.load(f)
-                
-            best_dna = data.get("best_dna", DEFAULT_DNA)
-            best_score = data.get("best_score", 0)
-            last_dna = data.get("last_dna", DEFAULT_DNA)
-            last_won = data.get("last_won", False)
-            last_turns = data.get("last_turns", 0)
-            
-            if last_won or last_turns > best_score:
-                best_dna = last_dna
-                best_score = last_turns if not last_won else 99999
-                
-            perf_ratio = last_turns / best_score if best_score not in [0, 99999] else (1.0 if last_won else 0.0)
-            mutation_cap = 0.05 if last_won else max(0.05, 0.50 * (1.0 - perf_ratio))
-
-            new_dna = {t: max(0.1, v * (1 + random.uniform(-mutation_cap, mutation_cap))) 
-                       for t, v in best_dna.items()}
-                
-            with open(DNA_FILE, "w") as f:
-                json.dump({
-                    "best_dna": best_dna, "best_score": best_score,
-                    "last_dna": new_dna, "last_won": False, "last_turns": 0
-                }, f)
-                
-            return new_dna
-        except:
-            return DEFAULT_DNA.copy()
-
-def update_record(turn_count, is_win):
-    """Thread-safe silent update."""
-    with file_lock:
-        try:
-            if os.path.exists(DNA_FILE):
-                with open(DNA_FILE, "r") as f:
-                    data = json.load(f)
-                data["last_turns"] = turn_count
-                data["last_won"] = is_win
-                with open(DNA_FILE, "w") as f:
-                    json.dump(data, f)
-        except:
-            pass
-
 def move(my_pos, raw_board, grid_dim, players):
-    DIRS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
-    
-    # 1. TRIGGER EVOLUTION ON NEW ROUND
-    me_data = next(p for p in players if p['pos'] == my_pos)
-    if len(me_data['trail']) <= 1:
-        MEMORY["turn"] = 0
-        MEMORY["dna"] = load_and_evolve() 
-        
-    MEMORY["turn"] += 1
-    
-    # 2. THE SHADOW BOARD (Ignores cheating bots)
-    true_board = set()
-    alive_opps = []
-    for p in players:
-        for t_pos in p['trail']:
-            true_board.add(t_pos)
-        if p['alive'] and p['pos'] != my_pos:
-            alive_opps.append(p)
-
-    def is_safe(p):
-        return 0 <= p[0] < grid_dim and 0 <= p[1] < grid_dim and p not in true_board
-
-    # Log survival safely
-    update_record(MEMORY["turn"], len(alive_opps) == 0)
-
-    # 3. FAST VORONOI
-    def evaluate_space(target_pos):
-        q = collections.deque([(target_pos, 0)])
-        owners = {target_pos: 0}
-        for i, op in enumerate(alive_opps):
-            owners[op['pos']] = i + 1
-            q.append((op['pos'], i + 1))
-        area, edges = 0, 0
-        while q:
-            curr, owner = q.popleft()
-            if owner == 0: area += 1
-            for dx, dy in DIRS.values():
-                nxt = (curr[0]+dx, curr[1]+dy)
-                if not is_safe(nxt):
-                    if owner == 0: edges += 1
-                elif nxt not in owners:
-                    owners[nxt] = owner
-                    q.append((nxt, owner))
-        return area, edges
-
-    # 4. APPLY DNA TO THE ULTIMATE MATH
     x, y = my_pos
-    closest_enemy_dist = min([abs(x - o['pos'][0]) + abs(y - o['pos'][1]) for o in alive_opps]) if alive_opps else float('inf')
+    dirs = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+    blocked = set(raw_board.keys())
+
+    me = next(p for p in players if p['pos'] == my_pos)
     
-    scored_moves = []
-    dna = MEMORY["dna"]
+    # Reset memory on new match
+    if not MEMORY["initialized"] or len(me['trail']) <= 1:
+        MEMORY["turn"] = 0
+        MEMORY["profiles"] = {p['id']: {"last_dist": 999, "aggro": 0} for p in players if p['id'] != me['id']}
+        MEMORY["initialized"] = True
+
+    MEMORY["turn"] += 1
+    enemies = [p for p in players if p['pos'] != my_pos and p.get('alive', True)]
     
-    for d_name, (dx, dy) in DIRS.items():
-        target = (x + dx, y + dy)
-        if is_safe(target):
-            true_board.add(target)
-            area, edges = evaluate_space(target)
-            true_board.remove(target)
+    # --- 1. DYNAMIC PROFILING ---
+    highest_threat_aggro = 0
+    closest_enemy_dist = 999
+    
+    for e in enemies:
+        eid = e['id']
+        dist = abs(x - e['pos'][0]) + abs(y - e['pos'][1])
+        closest_enemy_dist = min(closest_enemy_dist, dist)
+        
+        prof = MEMORY["profiles"].get(eid, {"last_dist": dist, "aggro": 0})
+        
+        # If they moved closer to us, increase their aggression score
+        if dist < prof["last_dist"]:
+            prof["aggro"] = min(10, prof["aggro"] + 2)
+        elif dist > prof["last_dist"]:
+            prof["aggro"] = max(0, prof["aggro"] - 1)
             
-            # Use DNA to weigh the ultimate combat logic!
-            if closest_enemy_dist < 6:
-                compactness = edges / (area if area > 0 else 1)
-                score = (area * dna["hunted_area"]) + (compactness * dna["hunted_compact"])
-            else:
-                dist_to_mid = abs(target[0] - grid_dim//2) + abs(target[1] - grid_dim//2)
-                score = (area * dna["safe_area"]) + (edges * dna["safe_edges"]) - (dist_to_mid * dna["safe_mid_penalty"])
-                
+        prof["last_dist"] = dist
+        MEMORY["profiles"][eid] = prof
+        
+        if dist < 15:
+            highest_threat_aggro = max(highest_threat_aggro, prof["aggro"])
+
+    # --- 2. ADAPTIVE WEIGHTS ---
+    if not enemies or closest_enemy_dist > 25:
+        # STANCE: ISOLATED (End-Game Packing)
+        # We are alone. Maximize space, ignore voronoi, strictly hug walls.
+        w_space, w_voronoi, w_openness, w_packing = 20.0, 0.0, 0.0, 15.0
+    elif highest_threat_aggro >= 6:
+        # STANCE: MATADOR (Evasion)
+        # Running from an aggressive bot. Prioritize wide open spaces to escape.
+        w_space, w_voronoi, w_openness, w_packing = 8.0, 2.0, 15.0, -5.0 
+    else:
+        # STANCE: ANACONDA (Aggressive Area Denial)
+        # Fighting a passive bot (like corbin might be). Steal their space.
+        w_space, w_voronoi, w_openness, w_packing = 5.0, 15.0, 3.0, 2.0
+
+    # --- 3. SHADOW VORONOI ---
+    def is_safe(nx, ny, extra_blocked=None):
+        if not (0 <= nx < grid_dim and 0 <= ny < grid_dim): return False
+        if (nx, ny) in blocked: return False
+        if extra_blocked and (nx, ny) in extra_blocked: return False
+        return True
+
+    enemy_reach = {}
+    if enemies:
+        q = deque([(e['pos'][0], e['pos'][1], 0) for e in enemies])
+        while q:
+            cx, cy, d = q.popleft()
+            if d > 12: continue # Fast local mapping
+            for dx, dy in dirs.values():
+                nx, ny = cx + dx, cy + dy
+                if is_safe(nx, ny) and (nx, ny) not in enemy_reach:
+                    enemy_reach[(nx, ny)] = d + 1
+                    q.append((nx, ny, d + 1))
+
+    # --- 4. SPACE EVALUATION ---
+    def evaluate(start_node):
+        q = deque([(start_node[0], start_node[1], 1)])
+        visited = {start_node}
+        parity = {0: 0, 1: 0}
+        openness = 0
+        voronoi_count = 0
+
+        while q:
+            cx, cy, d = q.popleft()
+            if d > 300: break # Keep under the timeout limit
+            
+            parity[(cx + cy) % 2] += 1
+            
+            # Openness: How many safe exits does this tile have?
+            safe_exits = sum(1 for dx, dy in dirs.values() if is_safe(cx+dx, cy+dy, {start_node}))
+            if safe_exits >= 3: openness += 1
+
+            for dx, dy in dirs.values():
+                nx, ny = cx + dx, cy + dy
+                if is_safe(nx, ny, {start_node}) and (nx, ny) not in visited:
+                    # Can I get here before the enemy?
+                    if d + 1 < enemy_reach.get((nx, ny), 999):
+                        voronoi_count += 1
+                        visited.add((nx, ny))
+                        q.append((nx, ny, d + 1))
+
+        # True space calculates checkerboard parity to prevent dead-ends
+        true_space = min(parity[0], parity[1]) * 2
+        return true_space, openness, voronoi_count
+
+    # --- 5. DECISION ENGINE ---
+    scored_moves = []
+    for d_name, (dx, dy) in dirs.items():
+        target = (x + dx, y + dy)
+        if is_safe(target[0], target[1]):
+            
+            # The "Sudden Death" shield: Never step where an enemy can step next turn
+            enemy_arrival = enemy_reach.get(target, 999)
+            collision_risk = -1000 if enemy_arrival <= 1 else 0
+
+            space, open_val, vor_val = evaluate(target)
+
+            score = (space * w_space) + (vor_val * w_voronoi) + (open_val * w_openness) + collision_risk
+
+            # Packing bonus: Hugs walls based on our dynamic stance
+            obstacles = sum(1 for dx2, dy2 in dirs.values() if not is_safe(target[0]+dx2, target[1]+dy2))
+            score += (obstacles * w_packing)
+
             scored_moves.append((score, d_name))
 
-    if not scored_moves:
-        return "UP"
+    if not scored_moves: 
+        return "UP" # Better to try a move than crash out
         
-    return max(scored_moves, key=lambda i: i[0])[1]
+    return max(scored_moves, key=lambda x: x[0])[1]

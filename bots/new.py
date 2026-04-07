@@ -85,6 +85,16 @@ def evaluate_move_with_prediction(my_future_pos, enemies, board, grid_dim):
     # Find the most immediate threat (closest enemy)
     closest_enemy = min(enemies, key=lambda e: abs(e[0] - my_future_pos[0]) + abs(e[1] - my_future_pos[1]))
     
+    # --- NEW: PROXIMITY FILTER ---
+    # Calculate Manhattan distance to the closest enemy
+    distance_to_enemy = abs(closest_enemy[0] - my_future_pos[0]) + abs(closest_enemy[1] - my_future_pos[1])
+    PREDICTION_RADIUS = 15 # Adjust this threshold based on your grid size
+    
+    # If the closest enemy is far away, don't waste time predicting their exact moves
+    if distance_to_enemy > PREDICTION_RADIUS:
+        return calculate_territory(my_future_pos, enemies, board, grid_dim)
+    # -----------------------------
+    
     # Figure out all valid moves the enemy could make next turn
     ex, ey = closest_enemy
     enemy_options = [(ex, ey - 1), (ex, ey + 1), (ex - 1, ey), (ex + 1, ey)]

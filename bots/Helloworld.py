@@ -1,22 +1,15 @@
-# helloworld.py
-# Improved version: direction-aware + fast flood-fill + right-hand bias
-# Designed to be fast enough for 60×60 visual mode
+# helloworld.py – Hamilton-style corridor maximizer (strong counter to Penguin 0)
 
 import random
 from collections import deque
 
 team_name = "HelloWorld"
 
-# Persistent state across turns
 prev_pos = None
-current_dir = "RIGHT"  # initial guess
+current_dir = "RIGHT"
 
-DIRECTIONS = {
-    "UP":    (0, -1),
-    "DOWN":  (0, 1),
-    "LEFT":  (-1, 0),
-    "RIGHT": (1, 0)
-}
+DIRECTIONS = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+OPPOSITE = {"UP":"DOWN", "DOWN":"UP", "LEFT":"RIGHT", "RIGHT":"LEFT"}
 
 RIGHT_HAND_RULE = {
     "UP":    ["RIGHT", "UP", "LEFT", "DOWN"],
@@ -25,85 +18,95 @@ RIGHT_HAND_RULE = {
     "LEFT":  ["UP", "LEFT", "DOWN", "RIGHT"]
 }
 
+# ── prefer this order when space is large ──
+LONG_CORRIDOR_RULE = {
+    "UP":    ["UP", "RIGHT", "LEFT", "DOWN"],     # straight first
+    "RIGHT": ["RIGHT", "DOWN", "UP", "LEFT"],
+    "DOWN":  ["DOWN", "LEFT", "RIGHT", "UP"],
+    "LEFT":  ["LEFT", "UP", "DOWN", "RIGHT"]
+}
+
 def infer_direction(old, new):
-    dx = new[0] - old[0]
-    dy = new[1] - old[1]
+    dx, dy = new[0] - old[0], new[1] - old[1]
     for d, (ddx, ddy) in DIRECTIONS.items():
-        if (dx, dy) == (ddx, ddy):
-            return d
-    return current_dir  # fallback
+        if (dx, dy) == (ddx, ddy): return d
+    return current_dir
 
-def is_valid(nx, ny, grid_dim, board):
-    return (0 <= nx < grid_dim and
-            0 <= ny < grid_dim and
-            (nx, ny) not in board)
+def is_safe(nx, ny, grid_dim, board):
+    return 0 <= nx < grid_dim and 0 <= ny < grid_dim and (nx, ny) not in board
 
-def fast_flood_size(start, board, grid_dim, max_check=350):
-    """Fast BFS with early cutoff – good enough approximation"""
-    visited = set()
+def fast_flood(start, board, grid_dim, max_check=550):
+    visited = set([start])
     q = deque([start])
-    visited.add(start)
     count = 1
-
     while q and count < max_check:
         cx, cy = q.popleft()
-        for dx, dy in [(0,-1), (0,1), (-1,0), (1,0)]:
+        for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
             nx, ny = cx + dx, cy + dy
-            if is_valid(nx, ny, grid_dim, board) and (nx, ny) not in visited:
+            if is_safe(nx, ny, grid_dim, board) and (nx, ny) not in visited:
                 visited.add((nx, ny))
                 q.append((nx, ny))
                 count += 1
                 if count >= max_check:
-                    return max_check + 500  # treat as "very large"
+                    return max_check + 3000
     return count
 
 def move(my_pos, board, grid_dim, players):
     global prev_pos, current_dir
 
-    # Update our facing direction from previous move
     if prev_pos is not None:
         current_dir = infer_direction(prev_pos, my_pos)
     prev_pos = my_pos
 
-    # Get preferred moves in right-hand order
+    # Choose rule based on board openness
+    rule = LONG_CORRIDOR_RULE if len(board) < grid_dim*grid_dim//3 else RIGHT_HAND_RULE
     candidates = []
-    for d in RIGHT_HAND_RULE[current_dir]:
+
+    for d in rule[current_dir]:
         dx, dy = DIRECTIONS[d]
         nx, ny = my_pos[0] + dx, my_pos[1] + dy
-        if is_valid(nx, ny, grid_dim, board):
+        if is_safe(nx, ny, grid_dim, board):
             candidates.append((d, (nx, ny)))
 
-    # If no preferred moves, allow any safe direction
     if not candidates:
         for d in ["UP", "DOWN", "LEFT", "RIGHT"]:
             dx, dy = DIRECTIONS[d]
             nx, ny = my_pos[0] + dx, my_pos[1] + dy
-            if is_valid(nx, ny, grid_dim, board):
+            if is_safe(nx, ny, grid_dim, board):
                 candidates.append((d, (nx, ny)))
         if not candidates:
-            return "UP"  # trapped – die
+            return "UP"
 
-    # ─── Decision: prefer largest reachable area + direction bias ───
     best_dir = None
-    best_score = -1
+    best_score = -999999
 
     for d, next_pos in candidates:
-        # Pretend we move there
         temp_board = board.copy()
-        temp_board[next_pos] = 999  # dummy player id – just mark occupied
+        temp_board[next_pos] = 999
 
-        space = fast_flood_size(next_pos, temp_board, grid_dim)
+        space = fast_flood(next_pos, temp_board, grid_dim)
 
-        score = space
+        score = space * 10000
 
-        # Small bias: prefer continuing straight or turning right
+        # Very strong corridor bias
         if d == current_dir:
-            score += 80
-        elif d == RIGHT_HAND_RULE[current_dir][0]:
-            score += 120
+            score += 600
+        elif d == rule[current_dir][0]:
+            score += 400
+
+        # Avoid 180° very strongly
+        if d == OPPOSITE.get(current_dir, None):
+            score -= 2500
+
+        # Avoid closing into dead-ends early
+        free_n = sum(1 for dx, dy in DIRECTIONS.values()
+                     if is_safe(next_pos[0] + dx, next_pos[1] + dy,
+                                grid_dim, temp_board))
+        if space > 800 and free_n <= 2:
+            score -= 1800
 
         if score > best_score:
             best_score = score
             best_dir = d
 
-    return best_dir if best_dir else random.choice([d for d, _ in candidates])
+    return best_dir if best_dir else random.choice([d for d,_ in candidates])
